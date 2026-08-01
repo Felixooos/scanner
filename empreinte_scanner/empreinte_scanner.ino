@@ -273,6 +273,12 @@ void envoyerImageUSB() {
 /* ---------- le tableau de bord lumineux ---------- */
 
 static bool doigtArme = true;      // false = doigt pas encore relache (anti-repetition)
+
+// Veille (declarees ici : setup() s'en sert, et l'Arduino exige que les
+// variables soient connues AVANT leur premiere utilisation).
+static const uint32_t SILENCE_VEILLE = 30000;   // ms de silence du Mac
+static bool enVeille = false;
+static uint32_t dernierMot = 0;                 // date du dernier octet recu
 static EtatLed etatLed = ETAT_DEMARRAGE;
 static uint32_t etatDepuis = 0;
 static EtatLed etatApres = ETAT_PRET;      // etat vers lequel revenir (OK/ERREUR)
@@ -427,6 +433,9 @@ void setup() {
     changerEtat(ETAT_MUET);
   }
   Serial.println("# Appuie sur le bouton (ou envoie SCAN depuis le Mac).");
+  // Le compte a rebours de la veille ne demarre qu'ici : la detection du
+  // capteur prend plusieurs secondes, elles ne doivent pas etre comptees.
+  dernierMot = millis();
 }
 
 // Tente la capture pendant 10 s, puis transfere l'image.
@@ -648,6 +657,34 @@ static void surveillerToucher() {
                  : ")");
 }
 
+/* ---------- veille ----------
+ * App fermee = plus rien ne doit rester allume. On coupe VA, la broche qui
+ * alimente le circuit tactile du capteur (et son anneau lumineux), ainsi que
+ * les LEDs du tableau de bord. L'ESP32 reste alimente par l'USB et guette la
+ * reouverture de l'app : le moindre caractere recu le reveille.
+ *
+ * L'alimentation principale du capteur (broche 1) est cablee en dur sur le
+ * 3V3 : elle, on ne peut pas la couper sans ajouter un transistor.
+ */
+static void entrerVeille() {
+  if (enVeille) return;
+  enVeille = true;
+  digitalWrite(BROCHE_VA, LOW);                 // circuit tactile eteint
+  rgb(0, 0, 0);
+  bleues(0, 0);
+  Serial.println("# veille : capteur eteint, en attente de l'app.");
+}
+
+static void sortirVeille() {
+  if (!enVeille) return;
+  enVeille = false;
+  digitalWrite(BROCHE_VA, HIGH);
+  delay(60);                                    // le tactile se stabilise
+  doigtArme = true;                             // pas de faux declenchement
+  changerEtat(ETAT_PRET);
+  Serial.println("# reveil : capteur rallume.");
+}
+
 // Bouton : anti-rebond simple, un seul evenement par appui.
 static void lireBouton() {
   static bool enfonceAvant = false;
@@ -666,9 +703,13 @@ static void lireBouton() {
 void loop() {
   while (Serial.available()) {
     char c = Serial.read();
+    dernierMot = millis();                 // le Mac parle : il est toujours la
+    sortirVeille();                        // (sans effet s'il ne dormait pas)
     if (c == '\n' || c == '\r') {
       ordre.trim();
-      if (ordre.equalsIgnoreCase("SCAN")) lancerScan();
+      if (ordre.equalsIgnoreCase("PING")) { /* battement : rien a faire */ }
+      else if (ordre.equalsIgnoreCase("VEILLE")) { ordre = ""; entrerVeille(); break; }
+      else if (ordre.equalsIgnoreCase("SCAN")) lancerScan();
       else if (ordre.equalsIgnoreCase("DIAG")) diagnostic();
       else if (ordre.equalsIgnoreCase("DIAGTCH")) diagnosticToucher();
       else if (ordre.equalsIgnoreCase("TESTLED")) testLeds();
@@ -682,6 +723,13 @@ void loop() {
     } else if (ordre.length() < 32) {
       ordre += c;
     }
+  }
+  // App fermee (ou plantee) : on s'eteint tout seul au bout d'un silence.
+  if (!enVeille && millis() - dernierMot > SILENCE_VEILLE) entrerVeille();
+
+  if (enVeille) {                          // rien ne tourne, rien ne brille
+    delay(50);
+    return;
   }
   lireBouton();
   surveillerToucher();                     // doigt pose -> scan automatique

@@ -32,7 +32,16 @@ struct ContentView: View {
             .animation(.easeInOut(duration: 0.22), value: moteur.ecran)
         }
         .frame(minWidth: 980, minHeight: 660)
-        .onAppear { moteur.demarrer() }
+        .onAppear {
+            moteur.demarrer()
+            // Vérification SILENCIEUSE, quelques secondes après le démarrage
+            // (le moteur passe d'abord) : en cas de nouveauté, une simple
+            // pastille rouge apparaît sur la roue dentée. Aucune fenêtre ne
+            // s'impose, aucun message si Internet manque.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 4) {
+                MiseAJour.partagee.verifier(silencieux: true)
+            }
+        }
         .onDisappear { moteur.arreter() }
     }
 }

@@ -160,6 +160,37 @@ def led(mot):
         pass
 
 
+def _battement():
+    """Dit à l'ESP32, régulièrement, que l'app est toujours ouverte.
+
+    Sans ce battement, la carte s'endort au bout d'une trentaine de secondes
+    et éteint le capteur (voir SILENCE_VEILLE dans le firmware) : c'est ce qui
+    fait que le capteur s'éteint tout seul quand on ferme l'application, même
+    si elle a été quittée brutalement."""
+    while True:
+        time.sleep(10)
+        if sp is None:
+            continue
+        try:
+            with verrou_serie:
+                sp.write(b"PING\n")
+        except Exception:
+            pass
+
+
+def endormir_capteur():
+    """Éteint le capteur avant de rendre la main (fermeture de l'app)."""
+    if sp is None:
+        return
+    try:
+        with verrou_serie:
+            sp.write(b"VEILLE\n")
+            sp.flush()
+    except Exception:
+        pass
+    time.sleep(0.2)          # laisse partir l'ordre avant de fermer le port
+
+
 def _ecouteur_bouton():
     """Guette l'appui sur le bouton quand aucun scan n'est en cours."""
     while True:
@@ -759,6 +790,7 @@ def injecter_empreinte(chemin):
 
 def boucle():
     threading.Thread(target=_ecouteur_bouton, daemon=True).start()
+    threading.Thread(target=_battement, daemon=True).start()
     _migration_douce()
     try:
         dossier_stock = mag.lire_dossier()            # créé s'il n'existe pas
@@ -827,6 +859,7 @@ def boucle():
                 envoyer(event="error", raison=f"commande inconnue : {verbe}")
         except Exception as erreur:
             envoyer(event="error", raison=str(erreur))
+    endormir_capteur()               # l'app se ferme : le capteur s'éteint
     if sp is not None:
         try:
             sp.close()

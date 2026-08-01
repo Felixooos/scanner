@@ -13,6 +13,13 @@ Empreinte_MMD.zip
 app_mac/.build_bin/
 app_mac/Empreinte.app/
 
+# ─── EXCEPTION : le paquet publié ───────────────────────────────────────
+# dist/Empreinte_MMD.zip est le paquet que l'app va TÉLÉCHARGER quand
+# maman clique « Mettre à jour ». Celui-là doit être versionné, sinon il
+# n'existe pas sur GitHub. Écrit uniquement par ./publier.sh.
+!dist/
+!dist/Empreinte_MMD.zip
+
 # ─── macOS / Python ─────────────────────────────────────────────────────
 .DS_Store
 __pycache__/

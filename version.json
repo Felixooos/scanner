@@ -1,0 +1,7 @@
+{
+  "version": "2.0",
+  "date": "2026-08-01",
+  "notes": "Première version publiée en ligne. À partir de maintenant, le bouton « Rechercher une mise à jour » (roue dentée, en haut à droite) installe les nouveautés toute seule.",
+  "zip": "https://raw.githubusercontent.com/Felixooos/scanner/main/dist/Empreinte_MMD.zip",
+  "paquets_python": ["pyserial", "numpy", "opencv-python", "scipy", "scikit-image", "fingerprint-enhancer"]
+}

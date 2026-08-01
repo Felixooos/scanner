@@ -271,6 +271,8 @@ enum LibelleForme {
 
 struct MenuReglages: View {
     @ObservedObject var moteur: Moteur
+    @ObservedObject var maj = MiseAJour.partagee
+    @State private var panneauMAJ = false
     @Environment(\.echelle) private var echelle
 
     var body: some View {
@@ -294,6 +296,19 @@ struct MenuReglages: View {
             Button("Rechercher les capteurs") { moteur.rafraichirPorts() }
             Divider()
             Button("Rafraîchir la liste des commandes") { moteur.chargerCommandes() }
+            Divider()
+            Text("Application — version \(maj.versionInstallee)")
+            Button(maj.disponible
+                   ? "Mise à jour disponible (\(maj.info?.version ?? ""))…"
+                   : "Rechercher une mise à jour…") {
+                panneauMAJ = true
+                maj.verifier()
+            }
+            if maj.retourPossible {
+                Button("Revenir à la version \(maj.versionSauvegardee ?? "")…") {
+                    panneauMAJ = true
+                }
+            }
         } label: {
             Image(systemName: "gearshape.fill")
                 .police(13, .bold)
@@ -302,9 +317,23 @@ struct MenuReglages: View {
                 .background(Capsule().fill(Color.white)
                     .overlay(Capsule().strokeBorder(MMD.noir.opacity(0.2),
                                                     lineWidth: 1.3 * echelle)))
+                // Pastille discrète : une mise à jour existe. Jamais de
+                // fenêtre qui s'impose — maman clique quand elle veut.
+                .overlay(alignment: .topTrailing) {
+                    if maj.disponible {
+                        Circle().fill(MMD.rouge)
+                            .frame(width: 9 * echelle, height: 9 * echelle)
+                            .overlay(Circle().strokeBorder(MMD.creme,
+                                                           lineWidth: 1.5 * echelle))
+                            .offset(x: 2 * echelle, y: -2 * echelle)
+                    }
+                }
         }
         .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
-        .help("Réglages")
+        .help(maj.disponible ? "Réglages — une mise à jour est disponible" : "Réglages")
+        .sheet(isPresented: $panneauMAJ) {
+            PanneauMiseAJour(moteur: moteur, maj: maj)
+        }
     }
 
     private func choisirDossier() {
