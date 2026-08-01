@@ -1,0 +1,19 @@
+# ─── DONNÉES PERSONNELLES — NE JAMAIS PUBLIER ───────────────────────────
+# Le dépôt est public. Les empreintes digitales sont des données
+# biométriques, et les rendus portent le nom des clients.
+photos/
+commandes/
+*.svg
+Empreintes MMD/
+
+# ─── Produits de construction ───────────────────────────────────────────
+Empreinte.app/
+Empreinte_MMD.zip
+.distribution/
+app_mac/.build_bin/
+app_mac/Empreinte.app/
+
+# ─── macOS / Python ─────────────────────────────────────────────────────
+.DS_Store
+__pycache__/
+*.pyc
