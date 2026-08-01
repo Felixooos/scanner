@@ -666,9 +666,64 @@ static void surveillerToucher() {
  * L'alimentation principale du capteur (broche 1) est cablee en dur sur le
  * 3V3 : elle, on ne peut pas la couper sans ajouter un transistor.
  */
+/* ---------- extinction de la lampe du capteur ----------
+ * L'alimentation du capteur (broche 1) est cablee en dur sur le 3V3 : on ne
+ * peut pas la couper. En revanche le protocole ZhianTec prevoit d'eteindre
+ * l'eclairage par commande. Deux dialectes existent selon le modele, on
+ * essaie les deux et on garde celui qui repond 0x00.
+ *   0x50 / 0x51 : allumer / eteindre (R305, R307, AS608...)
+ *   0x35        : "aura" (R503) — ctrl 3 = allumee fixe, 4 = eteinte
+ */
+static int lampeSimple(bool allumee) {
+  uint8_t charge[1] = { (uint8_t)(allumee ? 0x50 : 0x51) };
+  return commande(charge, 1, 500);
+}
+
+static int lampeAura(bool allumee) {
+  // ctrl, vitesse, couleur (1=rouge 2=bleu 3=violet), nombre de fois
+  uint8_t charge[5] = { 0x35, (uint8_t)(allumee ? 3 : 4), 0x00, 0x02, 0x00 };
+  return commande(charge, 5, 500);
+}
+
+static int dialecteLampe = -1;      // 0 = aucun, 1 = 0x50/0x51, 2 = aura
+
+// Eteint (ou rallume) la lampe avec le dialecte qui marche sur CE module.
+static void lampeCapteur(bool allumee) {
+  if (dialecteLampe == 0) return;                  // module muet la-dessus
+  if (dialecteLampe == 1) { lampeSimple(allumee); return; }
+  if (dialecteLampe == 2) { lampeAura(allumee); return; }
+  if (lampeSimple(allumee) == 0x00) { dialecteLampe = 1; return; }
+  if (lampeAura(allumee) == 0x00)   { dialecteLampe = 2; return; }
+  dialecteLampe = 0;
+}
+
+// "DIAGLED" : dit quelles commandes d'extinction le capteur accepte.
+static void diagnosticLampe() {
+  Serial.println("# DIAGLED : test des commandes d'extinction");
+  int a = lampeSimple(false);
+  Serial.print("#   0x51 (eteindre, dialecte simple) -> code ");
+  Serial.println(a);
+  delay(1200);
+  int b = lampeSimple(true);
+  Serial.print("#   0x50 (rallumer, dialecte simple) -> code ");
+  Serial.println(b);
+  delay(600);
+  int c = lampeAura(false);
+  Serial.print("#   0x35 (eteindre, dialecte aura)   -> code ");
+  Serial.println(c);
+  delay(1200);
+  int d = lampeAura(true);
+  Serial.print("#   0x35 (rallumer, dialecte aura)   -> code ");
+  Serial.println(d);
+  Serial.println(a == 0 || b == 0 ? "# -> dialecte SIMPLE accepte."
+                 : (c == 0 || d == 0 ? "# -> dialecte AURA accepte."
+                                     : "# -> aucun : il faudra couper le 3V3."));
+}
+
 static void entrerVeille() {
   if (enVeille) return;
   enVeille = true;
+  lampeCapteur(false);                          // lampe du capteur eteinte
   digitalWrite(BROCHE_VA, LOW);                 // circuit tactile eteint
   rgb(0, 0, 0);
   bleues(0, 0);
@@ -679,7 +734,8 @@ static void sortirVeille() {
   if (!enVeille) return;
   enVeille = false;
   digitalWrite(BROCHE_VA, HIGH);
-  delay(60);                                    // le tactile se stabilise
+  delay(60);
+  lampeCapteur(true);                           // on rallume la lampe                                    // le tactile se stabilise
   doigtArme = true;                             // pas de faux declenchement
   changerEtat(ETAT_PRET);
   Serial.println("# reveil : capteur rallume.");
@@ -712,6 +768,7 @@ void loop() {
       else if (ordre.equalsIgnoreCase("SCAN")) lancerScan();
       else if (ordre.equalsIgnoreCase("DIAG")) diagnostic();
       else if (ordre.equalsIgnoreCase("DIAGTCH")) diagnosticToucher();
+      else if (ordre.equalsIgnoreCase("DIAGLED")) diagnosticLampe();
       else if (ordre.equalsIgnoreCase("TESTLED")) testLeds();
       else if (ordre.startsWith("LED ") || ordre.startsWith("led ")) {
         String mot = ordre.substring(4);
