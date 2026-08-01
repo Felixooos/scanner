@@ -320,18 +320,14 @@ def _cretes_brutes(toile, lobe_net):
 
 
 def _periode_cretes(cretes):
-    """Espacement moyen des crêtes (pic du spectre de Fourier), en px."""
-    f = (cretes < 128).astype(np.float32) * 2 - 1     # +1 crête, -1 vallée
-    f -= f.mean()
-    fen = np.outer(np.hanning(f.shape[0]), np.hanning(f.shape[1])).astype(np.float32)
-    spectre = np.abs(np.fft.rfft2(f * fen)) ** 2
-    fy = np.fft.fftfreq(f.shape[0])[:, None]
-    fx = np.fft.rfftfreq(f.shape[1])[None, :]
-    rayon = np.sqrt(fx * fx + fy * fy)
-    bande = (rayon > 1.0 / 45) & (rayon < 1.0 / 5)
-    if not bande.any():
-        return 12.0
-    return float(np.clip(1.0 / rayon[bande][int(np.argmax(spectre[bande]))], 6, 40))
+    """Espacement moyen des crêtes (interligne), en px.
+
+    UNE SEULE MESURE POUR TOUT LE RENDU : c'est exactement celle dont
+    tracer_svg tire ses tolérances. L'épaisseur du trait et la géométrie du
+    tracé ne peuvent donc pas se contredire — un « Gabor plein » calé sur une
+    période et des traits calés sur une autre donneraient, sur la même
+    empreinte, des crêtes trop grasses ou trop maigres."""
+    return tracer_svg.periode_cretes(cretes)
 
 
 def _rasteriser(traits, h, w, chemin_png, largeur_trait, cote_max=1100):
@@ -347,7 +343,7 @@ def _rasteriser(traits, h, w, chemin_png, largeur_trait, cote_max=1100):
 
 def composer(mosaiques, forme, style, chemin_svg, apercu_png=None,
              crops=None, completions=None,
-             largeur_trait=tracer_svg.LARGEUR_TRAIT, tracer_contour=False,
+             largeur_trait=None, tracer_contour=False,
              ajusts=None):
     """Assemble les mosaïques dans la forme et écrit le SVG (+ un PNG d'aperçu
     si apercu_png est donné).
@@ -355,6 +351,13 @@ def composer(mosaiques, forme, style, chemin_svg, apercu_png=None,
     completions : liste de booléens (compléter les trous ?) par empreinte.
     ajusts : liste de {dx, dy, angle} (ou None) par empreinte — retouche fine
              du placement dans le lobe, voir appliquer_ajust.
+    largeur_trait : épaisseur du trait en px. None = calculée sur l'INTERLIGNE
+             mesuré de l'empreinte — c'est le cas normal. Une empreinte de
+             bébé a des crêtes environ deux fois plus serrées : un trait
+             d'épaisseur fixe y ferait fusionner deux crêtes voisines à la
+             gravure. Le trait garde donc la même part de l'interligne à
+             toutes les tailles (et le « gabor plein », déjà calé sur la
+             période, reste cohérent avec lui).
     style : "gabor" | "sans" | "contact" | "photo". Renvoie (chemin, nb)."""
     forme, style = nom_forme(forme), nom_style(style)
     n = len(mosaiques)
@@ -395,10 +398,16 @@ def composer(mosaiques, forme, style, chemin_svg, apercu_png=None,
         # les vallées entre crêtes restent toujours visibles.
         traits += tracer_svg.calculer_traits(
             cretes, masque_clip=lobe_net, contact=(style != "sans"))
-        if style == "gabor":
-            largeurs.append(_periode_cretes(cretes) * 0.52)
+        # l'épaisseur suit l'INTERLIGNE de CETTE empreinte (voir composer)
+        periode = _periode_cretes(cretes)
+        largeurs.append(periode * 0.52 if style == "gabor"
+                        else tracer_svg.largeur_trait_pour(periode))
 
-    largeur = float(np.median(largeurs)) if largeurs else largeur_trait
+    if largeur_trait is not None:                  # épaisseur imposée
+        largeur = float(largeur_trait)
+    else:
+        largeur = float(np.median(largeurs)) if largeurs \
+            else tracer_svg.LARGEUR_TRAIT
 
     morceaux = tracer_svg.entete_svg(w, h)
     morceaux += tracer_svg.groupe_traits(traits, largeur)

@@ -29,22 +29,82 @@ import sys
 import cv2
 import numpy as np
 
-PAS_ECHANTILLON = 3.0     # espacement des points le long d'un trait (px)
-DIST_RACCORD = 18.0       # distance maxi pour recoudre deux bouts (px)
-ANGLE_RACCORD = 40.0      # désalignement maxi pour recoudre (degrés)
-LONGUEUR_MINI = 22.0      # traits plus courts que ça : supprimés (px)
-ROGNAGE_BOUTS = 2.5       # raccourcissement de chaque extrémité (px)
-LARGEUR_TRAIT = 2.6       # épaisseur du trait SVG (px) — fin comme un stylo
-COURBURE_MAX = 11.0       # °/px : au-delà = demi-tour en épingle -> on coupe
+# --- TOUT EST À L'ÉCHELLE DE L'INTERLIGNE ----------------------------------
+# Une empreinte de BÉBÉ a des crêtes environ deux fois plus serrées que celle
+# d'un adulte (interligne ~8-12 px là où l'adulte est à ~20-24 px sur le même
+# canevas). Une tolérance exprimée en PIXELS ABSOLUS vaut alors le double en
+# proportion et détruit le tracé : 6 px d'écart mini, c'est 0,29 interligne
+# chez l'adulte mais 0,75 interligne chez le bébé — le mode « sans contact »
+# mangerait presque tout. Chaque réglage ci-dessous est donc donné en
+# PÉRIODES de crête ; la valeur en pixels qui l'accompagne n'est plus qu'un
+# PLANCHER anti-bruit (le capteur, lui, ne devient pas plus fin), jamais une
+# valeur de travail. Les valeurs sont calées pour redonner EXACTEMENT les
+# anciennes tolérances sur l'interligne adulte médian (21 px).
+PAS_PERIODES = 0.15       # espacement des points le long d'un trait, en
+PAS_PLANCHER = 1.0        # périodes, borné en px. 3 px fixes, c'était un demi
+PAS_ECHANTILLON = 3.0     # interligne sur des crêtes fines : le trait ne
+                          # pouvait plus suivre la courbe du cœur, et les
+                          # reculs de ecarter_bouts se faisaient par bonds
+                          # d'un demi interligne. Le PLAFOND reste 3 px : le
+                          # capteur ne devient pas plus fin quand les crêtes
+                          # sont plus grosses, échantillonner plus large ne
+                          # ferait que couper les virages.
+PONT_PLANCHER = 8.0       # plancher px de la portée de pontage. 18 px fixes
+                          # valaient 3 interlignes sur une empreinte de bébé :
+                          # le pont enjambait deux crêtes.
+DIST_RACCORD = 18.0       # portée de recoudre() seul (px) — voir recoudre()
+ANGLE_RACCORD = 40.0      # désalignement maxi pour recoudre (degrés) : un
+                          # angle, donc sans dimension, il reste absolu
+LONGUEUR_PLANCHER = 10.0  # plancher px du « trop court pour être une crête » ;
+                          # la vraie mesure est LONGUEUR_MINI_PERIODES. Les
+                          # 22 px fixes d'avant valaient 2,75 interlignes sur
+                          # des crêtes fines : de vraies crêtes étaient jetées.
+ROGNAGE_PERIODES = 0.12   # raccourcissement de chaque extrémité, en périodes,
+ROGNAGE_PLANCHER = 1.2    # borné en px. 0,12 × 21 = 2,5 px : la valeur
+ROGNAGE_BOUTS = 2.5       # historique de l'adulte, gardée comme PLAFOND — ce
+                          # rognage n'est qu'un blanc de courtoisie au bout du
+                          # trait, l'agrandir sur de grosses crêtes ne
+                          # servirait qu'à raccourcir le dessin.
+LARGEUR_PERIODES = 0.125  # épaisseur du trait SVG, en périodes, avec ce
+LARGEUR_PLANCHER = 1.2    # plancher px (en dessous, plus rien à graver).
+LARGEUR_TRAIT = 2.6       # 0,125 × 21 = 2,6 px : l'épaisseur historique, qui
+                          # reste celle de repli quand l'interligne est
+                          # inconnu. Un trait épais sur des crêtes fines fait
+                          # fusionner deux crêtes voisines à la gravure —
+                          # c'est le défaut que l'on veut éviter.
+COURBURE_RAYON = 220.0    # ° par période : au-delà = demi-tour en épingle.
+                          # La courbure d'un cœur d'empreinte est en 1/rayon
+                          # et le rayon suit l'interligne : sur des crêtes
+                          # deux fois plus serrées la courbure DOUBLE. Un
+                          # seuil fixe en °/px découpait le cœur d'un bébé en
+                          # confettis. 220/21 = 10,5 °/px chez l'adulte.
+COURBURE_MAX = 11.0       # (valeur historique adulte, gardée pour référence)
 AUTORISER_CONTACT = True   # True = les bifurcations se touchent (comme le Gabor)
 
 # Gouttes / spirales : un trait qui revient se coller à lui-même.
-DIST_PINCE = 14.0         # deux points du trait plus proches = pincement
-SEPARATION_MINI = 24.0    # ...s'ils sont éloignés d'au moins ça LE LONG du trait
+PINCE_PERIODES = 0.75     # deux points du trait plus proches que ça (en
+DIST_PINCE = 14.0         # périodes) = pincement ; DIST_PINCE reste un
+                          # PLAFOND px (une grande empreinte n'a pas besoin
+                          # d'un détecteur de goutte de 25 px de portée)
+PINCE_PLANCHER = 3.0      # ...et ce plancher px évite de couper sur du bruit
+SEPARATION_PERIODES = 2.5 # ...s'ils sont éloignés d'au moins ça LE LONG du
+SEPARATION_PLANCHER = 10.0  # trait (en périodes), avec ce plancher px
+SEPARATION_MINI = 24.0    # (valeur historique, défaut de defaire_gouttes)
 # Prolongement doux des bouts, sans jamais toucher un voisin.
-EXT_MAX = 7.0             # allongement maxi d'un bout (px)
-EXT_PAS = 1.0             # pas d'allongement (px)
-ECART_MINI = 6.0          # on s'arrête à cette distance d'un autre trait (px)
+EXT_PERIODES = 0.35       # allongement maxi d'un bout, en périodes, borné en
+EXT_PLANCHER = 2.0        # px. 7 px, la valeur historique, reste le PLAFOND :
+EXT_MAX = 7.0             # ce prolongement ne fait que refermer visuellement
+                          # une coupure ; l'allonger encore sur de grosses
+                          # crêtes ne gagne rien et lui laisse le temps de
+                          # s'enrouler (le trait finissait par se croiser).
+ECART_PERIODES = 0.30     # DISTANCE MINI ENTRE DEUX TRAITS, en périodes —
+ECART_PLANCHER = 2.0      # c'est la promesse du mode « sans contact » — avec
+ECART_MINI = 6.0          # ce plancher px (sous 2 px deux traits sont dans le
+                          # même pixel quel que soit l'interligne). 6 px, la
+                          # valeur historique, valait 0,29 interligne chez
+                          # l'adulte (d'où 0,30) mais 0,75 chez le bébé : le
+                          # mode « sans contact » lui mangeait tout le dessin.
+                          # Elle reste le repli quand l'interligne est inconnu.
 EXT_VIRAGE = 30.0         # virage maxi d'un prolongement (°) : il suit la
                           # courbure des crêtes, mais ne s'enroule pas
 
@@ -69,10 +129,13 @@ TANGENTE_LONGUE = 1.35    # 2e base de mesure de la direction d'un bout, en
                           # petit crochet qui fausse la tangente courte de
                           # plusieurs dizaines de degrés (voir ponter_coupures)
 SOUDURE_BIFURCATION = 0.52  # portée de la soudure des Y (mode contact), en
-SOUDURE_MINI = 6.0          # périodes, bornée en pixels : 11 px fixes
+SOUDURE_MINI = 3.0          # périodes, bornée en pixels : 11 px fixes
 SOUDURE_MAXI = 15.0         # laissaient un trou visible sur une grande
                             # empreinte et suffisaient à sauter sur la crête
-                            # voisine sur une petite.
+                            # voisine sur une petite. Le plancher est passé de
+                            # 6 à 3 px : 6 px valaient 0,75 interligne sur des
+                            # crêtes de bébé — la soudure allait chercher la
+                            # crête d'à côté au lieu de la branche du Y.
 # --- Champ d'orientation : c'est LUI qui fait foi ---------------------------
 # La tangente terminale d'une crête coupée est bruitée (le squelette finit
 # souvent par un petit crochet). L'orientation locale des crêtes, mesurée sur
@@ -121,13 +184,49 @@ DOUBLON_ECART = 0.38      # un court trait entièrement à cette distance (en
                           # périodes) d'un autre est un doublon : absorbé
 LONGUEUR_MINI_PERIODES = 2.0  # aucun trait final plus court que ça (en périodes)
 PORTEE_TANGENTE = 0.55    # longueur de mesure d'une tangente, en périodes
+PORTEE_PLANCHER = 4.0     # ...avec ce plancher px : en deçà de 4 px on ne lit
+                          # plus une direction mais le crénelage du squelette.
+                          # 7 px valaient plus d'un interligne sur des crêtes
+                          # de bébé : la tangente d'un bout y moyennait tout un
+                          # virage de crête au lieu de sa direction locale.
 PERIODE_DEFAUT = 14.0     # période de repli si la mesure échoue (px)
+ANNEAU_MINI = 24          # nb mini de cases du spectre dans un anneau pour
+                          # qu'il compte (voir periode_cretes) : en dessous on
+                          # ne mesure plus les crêtes mais la forme du doigt
 
 
 def longueur(points):
     if len(points) < 2:
         return 0.0
     return float(np.linalg.norm(np.diff(points, axis=0), axis=1).sum())
+
+
+# --- Réglages dérivés de l'interligne --------------------------------------
+# Un seul endroit où l'on passe des « périodes » aux pixels : le tracé d'une
+# empreinte de bébé est alors exactement celui d'un adulte, à l'échelle près.
+
+def largeur_trait_pour(periode):
+    """Épaisseur du trait SVG (px) pour cet interligne. Le trait garde la même
+    proportion de l'interligne à toutes les tailles : lisible et gravable sur
+    une crête d'adulte comme sur une crête de bébé, sans jamais que deux
+    crêtes voisines se rejoignent sous l'épaisseur du trait."""
+    return float(max(LARGEUR_PLANCHER, LARGEUR_PERIODES * float(periode)))
+
+
+def ecart_mini_pour(periode):
+    """Distance mini garantie entre deux traits différents (px). C'est la
+    promesse du mode « sans contact » ; en périodes elle ne bouge pas."""
+    return float(max(ECART_PLANCHER, ECART_PERIODES * float(periode)))
+
+
+def pas_pour(periode):
+    """Espacement des points le long d'un trait (px). Tout ce qui se compte en
+    POINTS (fenêtre de lissage, fondu de soudure, base de _bout) devient ainsi
+    proportionnel à l'interligne sans autre réglage — jusqu'au plafond de
+    3 px, au-delà duquel on n'échantillonne pas plus large (voir
+    PAS_ECHANTILLON)."""
+    return float(np.clip(PAS_PERIODES * float(periode),
+                         PAS_PLANCHER, PAS_ECHANTILLON))
 
 
 DIRS_8 = [(-1, -1), (-1, 0), (-1, 1), (0, -1),
@@ -320,16 +419,26 @@ def periode_cretes(cretes, defaut=PERIODE_DEFAUT):
     fx = np.fft.rfftfreq(f.shape[1])[None, :]
     rayon = np.sqrt(fx * fx + fy * fy)
 
-    ondes = np.arange(5, 41, dtype=np.float32)
+    # la fenêtre descend jusqu'à 4 px : une empreinte de bébé prise de près
+    # peut vraiment avoir un interligne de 5-6 px, et le plancher à 6 px
+    # d'avant lui attribuait une période trop grande — toutes les tolérances
+    # partaient alors du double de la bonne valeur.
+    ondes = np.arange(4, 41, dtype=np.float32)
     energie = np.zeros_like(ondes)
     for i, onde in enumerate(ondes):
         anneau = (rayon > 1.0 / (onde + 0.5)) & (rayon <= 1.0 / (onde - 0.5))
-        if anneau.any():
+        # UN ANNEAU TROP MINCE NE MESURE PLUS RIEN. Aux grandes longueurs
+        # d'onde l'anneau ne contient qu'une poignée de cases du spectre, et
+        # ces cases-là portent la FORME de l'empreinte (l'ovale du doigt), pas
+        # ses crêtes : leur moyenne écrase le vrai pic. Sur une empreinte
+        # petite ou fine — un bébé, précisément — l'interligne mesuré partait
+        # alors à 32 px au lieu de 11, et TOUTES les tolérances avec lui.
+        if int(anneau.sum()) >= ANNEAU_MINI:
             energie[i] = float(spectre[anneau].mean())
     if not energie.any():
         return defaut
     energie = cv2.GaussianBlur(energie.reshape(-1, 1), (1, 5), 0).ravel()
-    return float(np.clip(ondes[int(np.argmax(energie))], 6.0, 34.0))
+    return float(np.clip(ondes[int(np.argmax(energie))], 4.0, 34.0))
 
 
 def champ_orientation(cretes, periode=None):
@@ -400,7 +509,7 @@ def _moyenne_directions(dirs, poids, groupes=None, nb=None):
     return e, np.where(bon, n / np.where(W > 0, W, 1), 0.0)
 
 
-def _champ_aux_bouts(champ, lignes, ports, portee):
+def _champ_aux_bouts(champ, lignes, ports, portee, pas=None):
     """Direction des CRÊTES à chaque bout de trait, lue sur le champ le long
     du dernier `portee` de la ligne (jamais sur la seule tangente terminale).
     `ports` : liste de (indice de ligne, 0 = début / 1 = fin).
@@ -410,7 +519,9 @@ def _champ_aux_bouts(champ, lignes, ports, portee):
     nb = len(ports)
     if not nb or champ is None:
         return np.zeros((nb, 2)), np.zeros(nb), np.zeros((nb, 2))
-    m = max(2, int(portee / max(PAS_ECHANTILLON, 0.5)) + 2)
+    # `portee` est une longueur, `pas` l'espacement réel des points : le
+    # nombre de points à lire s'en déduit (et suit donc l'interligne).
+    m = max(2, int(portee / max(pas or PAS_ECHANTILLON, 0.5)) + 2)
     pts, grp = [], []
     chordes, ancres = np.zeros((nb, 2)), np.zeros((nb, 2))
     for k, (i, p) in enumerate(ports):
@@ -1010,7 +1121,7 @@ def ponter_coupures(lignes, dist_max=DIST_RACCORD, angle_max=ANGLE_RACCORD,
                     decalage_max=None, portee=12.0, seuil_court=None,
                     passes=6, marge_voisine=0.0, portee_longue=None,
                     champ=None, periode=None, angle_champ=ANGLE_CHAMP,
-                    coupures=None):
+                    coupures=None, pas=None):
     """PONTAGE DES COUPURES. Deux bouts libres qui se font face — orientations
     alignées, faible décalage latéral, écart inférieur à dist_max — sont les
     deux morceaux d'UNE crête cassée : on les relie par un raccord de Hermite
@@ -1084,7 +1195,7 @@ def ponter_coupures(lignes, dist_max=DIST_RACCORD, angle_max=ANGLE_RACCORD,
         if champ is not None:
             dirs_champ, fiab_champ, ancres_champ = _champ_aux_bouts(
                 champ, lignes, [(q[0], q[1]) for q in ports],
-                CHAMP_PORTEE * periode)
+                CHAMP_PORTEE * periode, pas=pas)
         else:
             dirs_champ = np.zeros((len(ports), 2))
             fiab_champ = np.zeros(len(ports))
@@ -1256,10 +1367,15 @@ def ponter_coupures(lignes, dist_max=DIST_RACCORD, angle_max=ANGLE_RACCORD,
     return lignes
 
 
-def recoudre(lignes):
+def recoudre(lignes, periode=None):
     """Fusionne les traits dont les bouts sont proches ET dans le
-    prolongement l'un de l'autre (coupures et carrefours traversés)."""
-    return ponter_coupures(lignes, DIST_RACCORD, ANGLE_RACCORD)
+    prolongement l'un de l'autre (coupures et carrefours traversés).
+    `periode` : interligne des crêtes — la portée du recollement le suit
+    (PONT_PORTEE périodes). Sans interligne connu, on retombe sur la valeur
+    historique DIST_RACCORD."""
+    dist = DIST_RACCORD if periode is None \
+        else max(PONT_PLANCHER, PONT_PORTEE * float(periode))
+    return ponter_coupures(lignes, dist, ANGLE_RACCORD, periode=periode)
 
 
 def absorber_doublons(lignes, ecart, seuil_court):
@@ -1291,10 +1407,15 @@ def absorber_doublons(lignes, ecart, seuil_court):
     return gardes
 
 
-def couper_epingles(points):
+def couper_epingles(points, courbure_max=COURBURE_MAX):
     """Coupe un trait là où il fait un demi-tour serré (épingle à cheveux).
     Les grandes courbes douces (cœur de l'empreinte) restent entières :
-    seule une courbure soutenue au-delà de COURBURE_MAX °/px coupe."""
+    seule une courbure soutenue au-delà de `courbure_max` °/px coupe.
+
+    Ce seuil DÉPEND DE L'INTERLIGNE (voir COURBURE_RAYON). Le cœur d'une
+    empreinte tourne sur un rayon de l'ordre de l'interligne : sur des crêtes
+    deux fois plus serrées, la même boucle a une courbure deux fois plus
+    forte. Un seuil fixe en °/px hachait le cœur d'un bébé en confettis."""
     if len(points) < 5:
         return [points]
     segments = np.diff(points, axis=0)
@@ -1306,10 +1427,10 @@ def couper_epingles(points):
     morceaux = []
     debut, i = 0, 0
     while i < len(taux):
-        if taux[i] > COURBURE_MAX:
+        if taux[i] > courbure_max:
             morceaux.append(points[debut:i + 1])
             fin = i
-            while fin < len(taux) and taux[fin] > COURBURE_MAX * 0.6:
+            while fin < len(taux) and taux[fin] > courbure_max * 0.6:
                 fin += 1              # saute toute la zone du virage
             debut = fin + 1
             i = debut
@@ -1347,15 +1468,24 @@ def defaire_gouttes(points, pince=DIST_PINCE, separation=SEPARATION_MINI):
     return morceaux
 
 
-def prolonger_bouts(lignes, champ=None):
+def prolonger_bouts(lignes, champ=None, ecart=ECART_MINI, ext_max=EXT_MAX,
+                    pas=None):
     """Allonge doucement chaque extrémité libre dans le prolongement du
     trait, mais s'arrête net avant de s'approcher d'un autre trait :
     les traits se rejoignent visuellement sans jamais se toucher.
     Faute de partenaire, une crête coupée se PROLONGE TOUT DROIT : si le
     champ d'orientation est donné, l'allongement suit les crêtes pas à pas
-    (jamais le petit crochet terminal du squelette, qui partirait de biais)."""
+    (jamais le petit crochet terminal du squelette, qui partirait de biais).
+
+    L'allongement se fait en 7 pas quel que soit l'interligne : CHAQUE point
+    ajouté est vérifié, pas seulement le dernier — un prolongement ne peut
+    donc pas venir longer une crête voisine. Attention toutefois : le nuage
+    de référence est celui d'AVANT les prolongements ; deux bouts allongés
+    l'un vers l'autre ne se voient pas. C'est ecarter_corps qui rattrape."""
     if len(lignes) < 2:
         return lignes
+    ext_max = float(max(ext_max, 1.0))
+    ext_pas = ext_max / 7.0                    # 7 pas, à toutes les échelles
     ids = np.concatenate([np.full(len(l), k) for k, l in enumerate(lignes)])
     nuage = np.vstack(lignes)
     try:
@@ -1378,7 +1508,7 @@ def prolonger_bouts(lignes, champ=None):
     if champ is not None:                      # tous les bouts d'un coup
         caps, fiab_caps, _ = _champ_aux_bouts(
             champ, lignes, [(k, p) for k in range(len(lignes)) for p in (0, 1)],
-            max(EXT_MAX, 3.0 * EXT_PAS))
+            max(ext_max, 3.0 * ext_pas), pas=pas)
 
     sorties = []
     for k, l in enumerate(lignes):
@@ -1391,9 +1521,9 @@ def prolonger_bouts(lignes, champ=None):
                 if fiab_caps[q] > COHERENCE_MINI and np.any(caps[q]):
                     tangente = caps[q]
             ajout, p, depart = [], pos.copy(), tangente.copy()
-            for _ in range(int(EXT_MAX / EXT_PAS)):
-                cand = p + tangente * EXT_PAS
-                if distance_autre(cand, k) < ECART_MINI:
+            for _ in range(7):
+                cand = p + tangente * ext_pas
+                if distance_autre(cand, k) < ecart:
                     break
                 ajout.append(cand)
                 p = cand
@@ -1414,12 +1544,21 @@ def prolonger_bouts(lignes, champ=None):
     return sorties
 
 
-def _masque_forme(cretes):
+def _masque_forme(cretes, periode=None):
     """Zone pleine occupée par l'empreinte (bord de l'ovale compris) : on
     ferme les crêtes en une silhouette pleine, on bouche les trous internes
-    et on garde le plus gros bloc. Sert à ne rien tracer hors du bord."""
+    et on garde le plus gros bloc. Sert à ne rien tracer hors du bord.
+    La fermeture doit combler le plus gros TROU de la carte de crêtes. Ces
+    trous viennent de la prise (doigt sec, bulle), pas de l'interligne : 25 px
+    restent donc un PLANCHER absolu — on ne referme jamais moins qu'avant, et
+    trop fermer ne fait qu'arrondir la silhouette (sans risque), tandis que
+    trop peu la troue et jette la moitié du tracé. Sur une empreinte à grosses
+    crêtes (interligne > 21 px) il faut en revanche fermer plus large."""
     ridges = ((cretes < 128) * 255).astype(np.uint8)
-    noyau = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (25, 25))
+    if periode is None:
+        periode = periode_cretes(cretes)
+    cote = int(max(25, round(1.2 * float(periode)))) | 1       # impair
+    noyau = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (cote, cote))
     plein = cv2.morphologyEx(ridges, cv2.MORPH_CLOSE, noyau)
     inverse = cv2.bitwise_not(plein)
     tampon = np.zeros((plein.shape[0] + 2, plein.shape[1] + 2), np.uint8)
@@ -1430,7 +1569,10 @@ def _masque_forme(cretes):
         grande = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
         plein = np.where(etiquettes == grande, 255, 0).astype(np.uint8)
     # rétrécit un peu : les traits s'arrêtent juste avant le bord net
-    return cv2.erode(plein, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
+    marge = int(max(3, round(0.25 * float(periode)))) | 1      # impair
+    return cv2.erode(plein,
+                     cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                               (marge, marge)))
 
 
 def clipper(lignes, masque):
@@ -1471,7 +1613,7 @@ def _accord_coupures(depart, arrivee, coupures, tolerance):
 
 def souder_bifurcations(lignes, seuil=11.0, angle_max=58.0, fondu=4,
                         champ=None, lateral_max=None, coupures=None,
-                        tolerance=None):
+                        tolerance=None, pas=None):
     """Recolle chaque bout libre sur la crête voisine SI ce bout se dirige
     vers elle (bifurcation / crête qui en rejoint une autre), pas s'il la
     longe (crêtes parallèles) : les Y se touchent comme sur le Gabor, sans
@@ -1504,7 +1646,8 @@ def souder_bifurcations(lignes, seuil=11.0, angle_max=58.0, fondu=4,
             soude = False
             if champ is not None and lateral_max:
                 e, f, _ = _champ_aux_bouts(champ, [lignes[k]],
-                                           [(0, 1 if fin else 0)], 2.0 * seuil)
+                                           [(0, 1 if fin else 0)], 2.0 * seuil,
+                                           pas=pas)
                 if f[0] > COHERENCE_MINI and np.any(e[0]):
                     e_crete = e[0]
             d, idx = arbre.query(pos, k=14)
@@ -1555,10 +1698,117 @@ def souder_bifurcations(lignes, seuil=11.0, angle_max=58.0, fondu=4,
     return lignes
 
 
+def _distance_aux_autres(lignes, k=40):
+    """Pour CHAQUE point de chaque trait : distance au trait DIFFÉRENT le plus
+    proche, et son numéro. Une seule requête pour tout le nuage.
+    Retourne (identifiants, distances, voisins) alignés sur np.vstack(lignes)."""
+    from scipy.spatial import cKDTree
+    ids = np.concatenate([np.full(len(l), i) for i, l in enumerate(lignes)])
+    nuage = np.vstack(lignes)
+    d, idx = cKDTree(nuage).query(nuage, k=int(min(k, len(nuage))))
+    d = np.atleast_2d(d)
+    idx = np.atleast_2d(idx)
+    autre = ids[idx] != ids[:, None]
+    trouve = autre.any(axis=1)
+    rang = np.argmax(autre, axis=1)             # 1er voisin d'un AUTRE trait
+    ligne = np.arange(len(nuage))
+    dist = np.where(trouve, d[ligne, rang], np.inf)
+    voisin = np.where(trouve, ids[idx[ligne, rang]], -1)
+    return ids, dist, voisin
+
+
+def ecarter_corps(lignes, ecart=ECART_MINI, longueur_mini=0.0, passes=8):
+    """AUCUN TRAIT N'EN TOUCHE UN AUTRE — SUR TOUTE SA LONGUEUR.
+
+    ecarter_bouts ne regarde que les deux EXTRÉMITÉS de chaque trait : c'était
+    la seule garde du mode « sans contact ». Tant que le tracé sortait en
+    petits morceaux, ça suffisait — un frôlement tombait presque toujours sur
+    un bout, qu'il reculait jusqu'à `ecart`. Depuis que les crêtes cassées
+    sont recousues, un même trait traverse la zone serrée en plein milieu :
+    le frôlement est à des dizaines de pixels du moindre bout et la garde ne
+    le voit plus. Deux axes à 2,3 px l'un de l'autre, pour un trait de 2,6 px
+    de large, c'est deux crêtes fusionnées à la gravure.
+
+    On OUVRE donc le trait là où il frôle : le tronçon fautif est retiré, et
+    la crête reprend juste après. À chaque frôlement on n'ouvre qu'UN des deux
+    traits — celui qui perd le moins (le calcul compte le tronçon retiré plus
+    les moignons devenus trop courts) : couper les deux enlèverait deux fois
+    trop de dessin. Un frôlement près d'un bout revient donc naturellement à
+    un simple raccourcissement, un frôlement en plein milieu à une coupure."""
+    lignes = [np.asarray(l, np.float64) for l in lignes if len(l) >= 2]
+    if ecart <= 0:
+        return lignes
+    for _ in range(max(1, passes)):
+        if len(lignes) < 2:
+            break
+        try:
+            ids, dist, voisin = _distance_aux_autres(lignes)
+        except Exception:
+            break
+        if not np.any(dist < ecart):
+            break
+        # 1. tous les tronçons fautifs, avec ce que coûterait de les ouvrir
+        propositions, debut = [], 0
+        for k, l in enumerate(lignes):
+            n = len(l)
+            en_faute = dist[debut:debut + n] < ecart
+            voisins_k = voisin[debut:debut + n]
+            debut += n
+            if not en_faute.any():
+                continue
+            arc = np.concatenate(
+                [[0.0], np.cumsum(np.linalg.norm(np.diff(l, axis=0), axis=1))])
+            bords = np.nonzero(np.diff(np.concatenate(
+                [[0], en_faute.astype(np.int8), [0]])))[0]
+            for i0, i1 in zip(bords[::2], bords[1::2] - 1):
+                gauche, droite = arc[i0], arc[-1] - arc[i1]
+                perte = (arc[i1] - arc[i0]
+                         + (gauche if gauche < longueur_mini else 0.0)
+                         + (droite if droite < longueur_mini else 0.0))
+                vs = voisins_k[i0:i1 + 1]
+                vs = vs[vs >= 0]
+                if not len(vs):
+                    continue
+                dominant = int(np.bincount(vs).argmax())
+                propositions.append((float(perte), k, int(i0), int(i1),
+                                     dominant))
+        if not propositions:
+            break
+        # 2. du moins coûteux au plus coûteux, un seul côté par frôlement
+        propositions.sort(key=lambda p: (p[0], p[1], p[2]))
+        ouvertures, regles = {}, set()
+        for perte, k, i0, i1, j in propositions:
+            couple = (min(k, j), max(k, j))
+            if couple in regles:
+                continue                       # l'autre côté est déjà ouvert
+            regles.add(couple)
+            ouvertures.setdefault(k, []).append((i0, i1))
+        # 3. découpe effective
+        sorties = []
+        for k, l in enumerate(lignes):
+            trous = sorted(ouvertures.get(k, []))
+            if not trous:
+                sorties.append(l)
+                continue
+            precedent = 0
+            for i0, i1 in trous:
+                if i0 - precedent >= 2:
+                    sorties.append(l[precedent:i0])
+                precedent = i1 + 1
+            if len(l) - precedent >= 2:
+                sorties.append(l[precedent:])
+        lignes = [m for m in sorties
+                  if len(m) >= 2 and longueur(m) >= longueur_mini]
+    return lignes
+
+
 def ecarter_bouts(lignes, ecart=ECART_MINI):
     """Garantie finale « aucun trait n'en touche un autre » : tant qu'une
     extrémité passe sous l'écart mini d'un autre trait, on la recule d'un
-    point. Rattrape aussi deux prolongements qui se rejoindraient."""
+    point. Rattrape aussi deux prolongements qui se rejoindraient.
+    Ne voit QUE les extrémités : un frôlement en plein milieu d'un trait lui
+    échappe complètement — c'est ecarter_corps qui s'en charge, et les deux
+    vont ensemble."""
     lignes = [l.copy() for l in lignes]
     try:
         from scipy.spatial import cKDTree
@@ -1633,8 +1883,15 @@ def calculer_traits(cretes, masque_clip=None, contact=None):
     from skimage.morphology import skeletonize
 
     periode = periode_cretes(cretes)              # interligne mesuré (px)
-    portee = max(7.0, PORTEE_TANGENTE * periode)  # base de mesure des tangentes
-    seuil = max(LONGUEUR_MINI, LONGUEUR_MINI_PERIODES * periode)
+    # TOUTES les tolérances se déduisent de cet interligne : le tracé d'une
+    # empreinte de bébé est celui d'un adulte, à l'échelle près.
+    portee = max(PORTEE_PLANCHER,                 # base de mesure des tangentes
+                 PORTEE_TANGENTE * periode)
+    seuil = max(LONGUEUR_PLANCHER, LONGUEUR_MINI_PERIODES * periode)
+    pas = pas_pour(periode)                       # espacement des points
+    ecart = ecart_mini_pour(periode)              # « sans contact » garanti
+    portee_pont = max(PONT_PLANCHER, PONT_PORTEE * periode)
+    courbure = COURBURE_RAYON / max(periode, 1.0)  # °/px (voir COURBURE_RAYON)
     champ = champ_orientation(cretes, periode)    # l'arbitre du pontage
     coupures = []                                 # coutures repérées (partagées)
 
@@ -1646,31 +1903,35 @@ def calculer_traits(cretes, masque_clip=None, contact=None):
     lignes = apparier_jonctions(lignes, extremites, portee)
 
     # un fragment plus court qu'un tiers d'interligne n'est pas une crête
-    lignes = [lisser(reechantillonner(l), passes=1)
-              for l in lignes if longueur(l) >= max(4.0, 0.3 * periode)]
+    lignes = [lisser(reechantillonner(l, pas), passes=1)
+              for l in lignes if longueur(l) >= max(2.0, 0.3 * periode)]
 
     # 2. les crêtes cassées sont pontées (reconstruction, pas un contact)
-    lignes = ponter_coupures(lignes, dist_max=max(DIST_RACCORD,
-                                                  PONT_PORTEE * periode),
+    lignes = ponter_coupures(lignes, dist_max=portee_pont,
                              angle_max=ANGLE_PONT,
                              decalage_max=PONT_DECALAGE * periode,
                              portee=portee,
                              portee_longue=TANGENTE_LONGUE * periode,
                              marge_voisine=MARGE_VOISINE * periode,
-                             champ=champ, periode=periode, coupures=coupures)
+                             champ=champ, periode=periode, coupures=coupures,
+                             pas=pas)
 
     morceaux = []
     for l in lignes:
-        l = lisser(reechantillonner(l), passes=2)
-        for coupe in couper_epingles(l):          # jamais de demi-tour serré
+        l = lisser(reechantillonner(l, pas), passes=2)
+        # jamais de demi-tour serré ; le seuil suit l'interligne
+        for coupe in couper_epingles(l, courbure):
             morceaux += defaire_gouttes(          # ni goutte ni spirale
-                coupe, pince=min(DIST_PINCE, 0.75 * periode),
-                separation=max(SEPARATION_MINI, 2.5 * periode))
-    morceaux = [m for m in morceaux if longueur(m) >= 4]
+                coupe,
+                pince=float(np.clip(PINCE_PERIODES * periode,
+                                    PINCE_PLANCHER, DIST_PINCE)),
+                separation=max(SEPARATION_PLANCHER,
+                               SEPARATION_PERIODES * periode))
+    morceaux = [m for m in morceaux if longueur(m) >= max(2.0, 0.2 * periode)]
 
     # 3. micro-traits : on essaie de les recoller AVANT de les jeter
     morceaux = ponter_coupures(morceaux,
-                               dist_max=max(DIST_RACCORD,
+                               dist_max=max(PONT_PLANCHER,
                                             RATTRAPAGE_PORTEE * periode),
                                angle_max=RATTRAPAGE_ANGLE,
                                decalage_max=0.6 * periode,
@@ -1679,23 +1940,35 @@ def calculer_traits(cretes, masque_clip=None, contact=None):
                                seuil_court=seuil, passes=3,
                                marge_voisine=MARGE_VOISINE * periode,
                                champ=champ, periode=periode,
-                               coupures=coupures)
+                               coupures=coupures, pas=pas)
     morceaux = absorber_doublons(morceaux, DOUBLON_ECART * periode, seuil)
 
     finales = []
+    rognage = float(np.clip(ROGNAGE_PERIODES * periode,
+                            ROGNAGE_PLANCHER, ROGNAGE_BOUTS))
     for morceau in morceaux:
         if longueur(morceau) < 0.7 * seuil:       # vraiment isolé et minuscule
             continue
         if not contact:
-            morceau = rogner(morceau)             # rétrécit pour ne pas toucher
+            morceau = rogner(morceau, rognage)    # rétrécit pour ne pas toucher
         if morceau is not None:
             finales.append(morceau)
 
     # faute de partenaire, un bout se prolonge TOUT DROIT (jamais de crochet)
-    finales = prolonger_bouts(finales, champ=champ)
+    finales = prolonger_bouts(finales, champ=champ, ecart=ecart,
+                              ext_max=float(np.clip(EXT_PERIODES * periode,
+                                                    EXT_PLANCHER, EXT_MAX)),
+                              pas=pas)
     if masque_clip is None:
-        masque_clip = _masque_forme(cretes)
+        masque_clip = _masque_forme(cretes, periode)
     finales = clipper(finales, masque_clip)       # bord net
+    # DERNIER contrôle d'épingle. couper_epingles ne passait qu'AVANT le
+    # rattrapage des micro-traits : les raccords de ce 2e pontage et les
+    # prolongements, posés après, n'étaient contrôlés par personne — un
+    # crochet du squelette recollé là ressortait en demi-tour dans le dessin
+    # final. Le seuil est le même qu'au premier passage : ce filet de
+    # sécurité ne peut pas couper une courbe que l'on avait déjà acceptée.
+    finales = [m for l in finales for m in couper_epingles(l, courbure)]
     finales = [l for l in finales if longueur(l) >= seuil]
     if contact:
         # portée de soudure calée sur l'interligne (voir SOUDURE_BIFURCATION)
@@ -1703,9 +1976,14 @@ def calculer_traits(cretes, masque_clip=None, contact=None):
             finales, seuil=float(np.clip(SOUDURE_BIFURCATION * periode,
                                          SOUDURE_MINI, SOUDURE_MAXI)),
             champ=champ, lateral_max=SOUDURE_LATERALE * periode,
-            coupures=coupures, tolerance=COUTURE_TOLERANCE * periode)
+            coupures=coupures, tolerance=COUTURE_TOLERANCE * periode, pas=pas)
     else:
-        finales = ecarter_bouts(finales)          # garantit l'absence de contact
+        # deux gardes complémentaires, et il faut les DEUX : ecarter_corps
+        # ouvre les frôlements en plein milieu d'un trait (que ecarter_bouts
+        # ne peut pas voir), ecarter_bouts finit le travail aux extrémités —
+        # y compris sur les bouts que ecarter_corps vient de créer.
+        finales = ecarter_corps(finales, ecart, seuil)
+        finales = ecarter_bouts(finales, ecart)
     return [l for l in finales if longueur(l) >= seuil]
 
 
@@ -1754,9 +2032,14 @@ def chemin_bezier_ferme(points):
     return " ".join(morceaux)
 
 
-def contours_remplis(cretes, masque_clip=None, echelle=2, aire_min=45):
+def contours_remplis(cretes, masque_clip=None, echelle=2, aire_min=None):
     """Style « Gabor plein » vectorisé : crêtes -> contours pleins lissés
-    (fini les pixels en escalier). Retourne une liste de contours (x, y)."""
+    (fini les pixels en escalier). Retourne une liste de contours (x, y).
+    `aire_min=None` : la plus petite tache gardée vaut 0,1 interligne² —
+    45 px² fixes, c'était un dixième de crête chez l'adulte mais une crête
+    entière chez le bébé, dont les traits disparaissaient en masse."""
+    if aire_min is None:
+        aire_min = max(6.0, 0.10 * periode_cretes(cretes) ** 2)
     ridge = ((cretes < 128).astype(np.uint8)) * 255
     if masque_clip is not None:
         ridge = cv2.bitwise_and(ridge, masque_clip)
@@ -1788,11 +2071,15 @@ def groupe_contours(contours, couleur="black"):
     return lignes
 
 
-def tracer_svg(cretes, chemin_svg, largeur_trait=LARGEUR_TRAIT):
+def tracer_svg(cretes, chemin_svg, largeur_trait=None):
     """Image de crêtes (uint8, crêtes sombres) -> fichier SVG.
-    Retourne le nombre de traits dessinés."""
+    Retourne le nombre de traits dessinés.
+    `largeur_trait=None` : l'épaisseur est calculée sur l'interligne mesuré —
+    le dessin reste lisible et gravable, crêtes d'adulte comme de bébé."""
     finales = calculer_traits(cretes)
     h, w = cretes.shape
+    if largeur_trait is None:
+        largeur_trait = largeur_trait_pour(periode_cretes(cretes))
     return ecrire_svg(finales, w, h, chemin_svg, largeur_trait)
 
 
