@@ -356,7 +356,12 @@ static void pwmEcrire(int broche, int canal, int valeur) {
 #endif
 }
 
+// Toutes les LEDs du tableau de bord (2 bleues + RGB) sont coupees : on ne
+// garde allume que le strict necessaire. Mettre a true pour les revoir vivre.
+static const bool LEDS_ACTIVES = false;
+
 static void rgb(int r, int v, int b) {
+  if (!LEDS_ACTIVES) r = v = b = 0;
   if (RGB_ANODE_COMMUNE) { r = 255 - r; v = 255 - v; b = 255 - b; }
   pwmEcrire(BROCHE_RGB_R, 2, r);
   pwmEcrire(BROCHE_RGB_V, 3, v);
@@ -364,6 +369,7 @@ static void rgb(int r, int v, int b) {
 }
 
 static void bleues(int a, int b) {
+  if (!LEDS_ACTIVES) a = b = 0;
   pwmEcrire(BROCHE_BLEUE_A, 0, a);
   pwmEcrire(BROCHE_BLEUE_B, 1, b);
 }
