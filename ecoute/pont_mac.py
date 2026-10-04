@@ -68,40 +68,45 @@ async def flux_faux(envoyer, actif):
 
 # --- source réelle : l'ESP32 par l'USB ------------------------------------
 async def flux_esp32(envoyer, actif):
-    """Ouvre le port, demande ECOUTE, recopie les frames PCM de l'ESP32.
+    """Ouvre le port, demande ECOUTE, recopie le son de l'ESP32.
 
-    Trame ESP32 : 0xA5 0x5A, puis nombre d'échantillons (2 octets, poids
-    faible d'abord), puis les échantillons (16 bits chacun)."""
+    L'ESP32 envoie une ligne par bloc de 16 ms : '@' + base64 de 256
+    échantillons PCM 16 bits. On décode et on transmet le PCM brut au relais.
+    On lui renvoie un PING toutes les 5 s, sinon il coupe au bout de 15 s."""
+    import base64
     port = trouver_port()
     if port is None:
         print("pont: aucun ESP32 trouvé (USB).", flush=True)
         return
     try:
-        sp = serial.Serial(port, 921600, timeout=0.3)
+        sp = serial.Serial(port, 921600, timeout=0.2)
     except Exception as e:
         print(f"pont: port occupé ou inaccessible ({e}).", flush=True)
         return
     try:
         sp.reset_input_buffer()
         sp.write(b"ECOUTE\n")
-        tampon = bytearray()
         boucle = asyncio.get_event_loop()
+        tampon = bytearray()
+        dernier_ping = time.monotonic()
         while actif():
-            data = await boucle.run_in_executor(None, sp.read, 4096)
+            if time.monotonic() - dernier_ping > 5:
+                sp.write(b"PING\n")               # garde l'écoute vivante
+                dernier_ping = time.monotonic()
+            data = await boucle.run_in_executor(None, sp.read, 2048)
             if data:
                 tampon += data
             while True:
-                i = tampon.find(b"\xa5\x5a")
-                if i < 0 or len(tampon) < i + 4:
-                    if i > 0:
-                        del tampon[:i]
+                fl = tampon.find(b"\n")
+                if fl < 0:
                     break
-                n = tampon[i + 2] | (tampon[i + 3] << 8)
-                fin = i + 4 + 2 * n
-                if len(tampon) < fin:
-                    break
-                await envoyer(bytes(tampon[i + 4:fin]))
-                del tampon[:fin]
+                ligne = tampon[:fl]
+                del tampon[:fl + 1]
+                if ligne[:1] == b"@":
+                    try:
+                        await envoyer(base64.b64decode(ligne[1:]))
+                    except Exception:
+                        pass                      # ligne tronquée : on saute
     finally:
         try:
             sp.write(b"STOP\n")

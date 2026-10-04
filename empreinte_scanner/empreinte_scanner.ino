@@ -25,6 +25,7 @@
 
 #include <HardwareSerial.h>
 #include <ESP_I2S.h>
+#include "mbedtls/base64.h"
 
 HardwareSerial capteur(2);                 // UART2 de l'ESP32
 
@@ -854,8 +855,69 @@ static void testMicro() {
     Serial.println("# MICRO : OK, le micro capte du son.");
 }
 
+/* ---------- ecoute en direct ----------
+ * "ECOUTE" : le micro diffuse en continu vers le Mac, sur le cable USB.
+ * Format : une ligne par bloc de 16 ms, '@' + base64 de 256 echantillons
+ * 16 bits little-endian, mono, 16 kHz (~43 ko/s sur les ~92 de la liaison).
+ * "STOP" arrete. Pendant l'ecoute, la detection du doigt est suspendue.
+ * Securite : sans un octet du Mac pendant 15 s (il envoie PING toutes les
+ * 5 s), on coupe tout seul -- le micro ne reste jamais ouvert pour personne.
+ */
+static I2SClass micro;
+static bool enEcoute = false;
+static int32_t dcQ = 0;                          // composante continue x1024
+static bool dcInit = false;
+static const uint32_t SILENCE_ECOUTE = 15000;
+
+static void demarrerEcoute() {
+  if (enEcoute) return;
+  micro.setPins(BROCHE_MIC_BCLK, BROCHE_MIC_WS, -1, BROCHE_MIC_DATA);
+  if (!micro.begin(I2S_MODE_STD, 16000, I2S_DATA_BIT_WIDTH_32BIT,
+                   I2S_SLOT_MODE_MONO, I2S_STD_SLOT_LEFT)) {
+    Serial.println("# ECOUTE : impossible de demarrer le micro.");
+    return;
+  }
+  lampeCapteur(false);
+  enEcoute = true;
+  dcInit = false;
+  Serial.println("# ECOUTE : micro actif.");
+}
+
+static void arreterEcoute() {
+  if (!enEcoute) return;
+  micro.end();
+  enEcoute = false;
+  doigtArme = true;                              // pas de faux declenchement
+  Serial.println("# ECOUTE : arretee.");
+}
+
+// Un bloc : 256 echantillons lus, nettoyes, encodes, envoyes.
+static void diffuserAudio() {
+  static int32_t brut[256];
+  static int16_t pcm[256];
+  static unsigned char ligne[700];
+  size_t n = micro.readBytes((char *)brut, sizeof(brut)) / 4;
+  if (n == 0) return;
+  for (size_t i = 0; i < n; i++) {
+    int32_t v = brut[i] >> 14;                   // 18 bits utiles du SPH0645
+    if (!dcInit) { dcQ = v << 10; dcInit = true; }
+    dcQ += v - (dcQ >> 10);                      // passe-haut (~2,5 Hz)
+    int32_t y = v - (dcQ >> 10);
+    if (y > 32767) y = 32767;
+    if (y < -32768) y = -32768;
+    pcm[i] = (int16_t)y;
+  }
+  size_t olen = 0;
+  ligne[0] = '@';
+  if (mbedtls_base64_encode(ligne + 1, sizeof(ligne) - 2, &olen,
+                            (const unsigned char *)pcm, n * 2) != 0) return;
+  ligne[1 + olen] = '\n';
+  Serial.write(ligne, olen + 2);
+}
+
 static void entrerVeille() {
   if (enVeille) return;
+  arreterEcoute();
   enVeille = true;
   lampeCapteur(false);                          // lampe du capteur eteinte
   alimTactile(false);                           // circuit tactile eteint
@@ -898,11 +960,13 @@ void loop() {
       ordre.trim();
       if (ordre.equalsIgnoreCase("PING")) { /* battement : rien a faire */ }
       else if (ordre.equalsIgnoreCase("VEILLE")) { ordre = ""; entrerVeille(); break; }
-      else if (ordre.equalsIgnoreCase("SCAN")) lancerScan();
+      else if (ordre.equalsIgnoreCase("ECOUTE")) demarrerEcoute();
+      else if (ordre.equalsIgnoreCase("STOP")) arreterEcoute();
+      else if (ordre.equalsIgnoreCase("SCAN")) { arreterEcoute(); lancerScan(); }
       else if (ordre.equalsIgnoreCase("DIAG")) diagnostic();
       else if (ordre.equalsIgnoreCase("DIAGTCH")) diagnosticToucher();
       else if (ordre.equalsIgnoreCase("DIAGLED")) diagnosticLampe();
-      else if (ordre.equalsIgnoreCase("MICRO")) testMicro();
+      else if (ordre.equalsIgnoreCase("MICRO")) { if (!enEcoute) testMicro(); }
       else if (ordre.equalsIgnoreCase("TEMP")) {
         if (!SONDE_TEMP) Serial.println("# Pas de sonde de temperature cablee (SONDE_TEMP = false).");
         else { Serial.print("# Temperature du regulateur : ");
@@ -920,6 +984,16 @@ void loop() {
       ordre += c;
     }
   }
+  if (enEcoute) {
+    if (millis() - dernierMot > SILENCE_ECOUTE) {
+      Serial.println("# ECOUTE : plus de nouvelles du Mac, on coupe.");
+      arreterEcoute();
+    } else {
+      diffuserAudio();
+      return;                                    // ni tactile ni animation
+    }
+  }
+
   // Sonde : toutes les 2 s. Trop chaud -> capteur en securite ; on ne
   // reprend qu'apres un vrai refroidissement (hysteresis de 20 degres).
   if (SONDE_TEMP && millis() - derniereLectureTemp > 2000) {
