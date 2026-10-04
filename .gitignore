@@ -24,3 +24,6 @@ app_mac/Empreinte.app/
 .DS_Store
 __pycache__/
 *.pyc
+
+# ─── Écoute : secrets de déploiement (jamais sur GitHub) ────────────────
+ecoute/deploiement/.env

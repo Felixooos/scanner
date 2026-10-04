@@ -1,0 +1,7 @@
+# Caddy obtient et renouvelle tout seul le certificat HTTPS pour ce domaine.
+# Il transmet aussi bien les requêtes web que les WebSockets (upgrade géré
+# automatiquement) vers le relais interne.
+{$ECOUTE_DOMAINE} {
+	encode zstd gzip
+	reverse_proxy relais:8787
+}

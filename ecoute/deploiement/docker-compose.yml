@@ -1,0 +1,35 @@
+# Déploiement du relais sur le VPS, avec HTTPS automatique (Caddy).
+# À lancer depuis ce dossier (deploiement/) après avoir rempli .env :
+#     docker compose up -d --build
+#
+# Le relais n'est PAS exposé directement : seul Caddy l'est (ports 80/443),
+# et il obtient tout seul un certificat Let's Encrypt pour ton domaine.
+
+services:
+  relais:
+    build:
+      context: ..                     # le dossier ecoute/ (relais.py, page.html)
+      dockerfile: deploiement/Dockerfile
+    restart: unless-stopped
+    environment:
+      ECOUTE_MOT_DE_PASSE: ${ECOUTE_MOT_DE_PASSE:?defini-le-dans-.env}
+      ECOUTE_JETON_SOURCE: ${ECOUTE_JETON_SOURCE:?defini-le-dans-.env}
+    expose:
+      - "8787"                        # visible seulement par Caddy, pas d'Internet
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      ECOUTE_DOMAINE: ${ECOUTE_DOMAINE:?defini-le-dans-.env}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  caddy_data:
+  caddy_config:
