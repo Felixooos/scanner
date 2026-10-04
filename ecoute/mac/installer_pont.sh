@@ -17,10 +17,18 @@ if [ -z "$URL" ] || [ -z "$JETON" ]; then
 fi
 
 ICI="$(cd "$(dirname "$0")" && pwd)"
-PONT="$(cd "$ICI/.." && pwd)/pont_mac.py"
-[ -f "$PONT" ] || { echo "pont_mac.py introuvable à côté ($PONT)"; exit 1; }
+SRC="$(cd "$ICI/.." && pwd)/pont_mac.py"
+[ -f "$SRC" ] || { echo "pont_mac.py introuvable à côté ($SRC)"; exit 1; }
 
-PY="$(command -v python3 || echo /usr/bin/python3)"
+# macOS interdit à un service (LaunchAgent) de lire le Bureau, Documents, etc.
+# On copie donc le pont dans un dossier non protégé, d'où il tournera.
+SUPPORT="$HOME/Library/Application Support/EcouteMMD"
+mkdir -p "$SUPPORT"
+cp "$SRC" "$SUPPORT/pont_mac.py"
+PONT="$SUPPORT/pont_mac.py"
+
+# python SYSTÈME (pas celui de Xcode, qui n'a pas aiohttp/pyserial).
+PY="/usr/bin/python3"
 LABEL="com.felix.ecoute.pont"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 LOG="$HOME/Library/Logs/ecoute-pont.log"
