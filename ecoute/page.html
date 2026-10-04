@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>Écoute</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  body {
+    margin: 0; min-height: 100vh; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 28px;
+    background: #0d0f12; color: #e9edf2;
+    font: 16px/1.4 -apple-system, system-ui, sans-serif;
+    padding: 32px;
+  }
+  h1 { font-size: 15px; font-weight: 600; letter-spacing: .08em;
+       text-transform: uppercase; color: #6b7480; margin: 0; }
+  #mdp {
+    width: 220px; padding: 14px 16px; font-size: 17px; text-align: center;
+    border: 1px solid #2a2f37; border-radius: 12px; background: #15181d;
+    color: #e9edf2; outline: none;
+  }
+  #mdp:focus { border-color: #3b82f6; }
+  button {
+    width: 220px; padding: 16px; font-size: 17px; font-weight: 600;
+    border: none; border-radius: 14px; background: #1f6feb; color: white;
+    cursor: pointer; transition: transform .08s, background .2s;
+  }
+  button:active { transform: scale(.97); }
+  button.ecoute { background: #d13b3b; }
+  button:disabled { opacity: .5; cursor: default; }
+  #etat { font-size: 14px; color: #8a929c; min-height: 20px; text-align: center; }
+  #niveau {
+    width: 220px; height: 6px; border-radius: 3px; background: #1a1d22;
+    overflow: hidden; opacity: 0; transition: opacity .3s;
+  }
+  #niveau > div { height: 100%; width: 0%; background: #3ba55d;
+                  transition: width .08s; }
+  .on #niveau { opacity: 1; }
+</style>
+</head>
+<body>
+  <h1>Écoute de la pièce</h1>
+  <input id="mdp" type="password" inputmode="numeric" placeholder="mot de passe"
+         autocomplete="current-password">
+  <button id="bouton">Écouter</button>
+  <div id="niveau"><div></div></div>
+  <div id="etat"></div>
+
+<script>
+const bouton = document.getElementById("bouton");
+const champMdp = document.getElementById("mdp");
+const etat = document.getElementById("etat");
+const barre = document.querySelector("#niveau > div");
+
+let ws = null, audioCtx = null, prochainDepart = 0, actif = false;
+
+function dire(t, couleur) { etat.textContent = t; etat.style.color = couleur || "#8a929c"; }
+
+function arreter(message) {
+  actif = false;
+  if (ws) { try { ws.close(); } catch (e) {} ws = null; }
+  if (audioCtx) { try { audioCtx.close(); } catch (e) {} audioCtx = null; }
+  document.body.classList.remove("on");
+  bouton.classList.remove("ecoute");
+  bouton.textContent = "Écouter";
+  bouton.disabled = false;
+  if (message) dire(message);
+}
+
+function demarrer() {
+  const mdp = champMdp.value;
+  if (!mdp) { dire("Entre le mot de passe."); return; }
+  bouton.disabled = true;
+  dire("Connexion…");
+
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  prochainDepart = 0;
+
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  ws = new WebSocket(proto + "://" + location.host + "/ecouter");
+  ws.binaryType = "arraybuffer";
+
+  ws.onopen = () => ws.send(mdp);
+
+  ws.onmessage = (ev) => {
+    if (typeof ev.data === "string") {
+      if (ev.data === "OK") {
+        actif = true;
+        document.body.classList.add("on");
+        bouton.classList.add("ecoute");
+        bouton.textContent = "Arrêter";
+        bouton.disabled = false;
+        dire("À l'écoute", "#3ba55d");
+      } else if (ev.data === "NON") {
+        arreter("Mot de passe refusé.");
+      }
+      return;
+    }
+    if (!actif || !audioCtx) return;
+    jouer(ev.data);
+  };
+
+  ws.onerror = () => { if (actif || bouton.disabled) arreter("Connexion perdue."); };
+  ws.onclose = () => { if (actif) arreter("Déconnecté."); else if (bouton.disabled) arreter("Impossible de se connecter."); };
+}
+
+// Reçoit un bloc de PCM 16 bits 16 kHz, le programme à la suite du précédent.
+function jouer(arrayBuffer) {
+  const pcm = new Int16Array(arrayBuffer);
+  if (pcm.length === 0) return;
+  const f32 = new Float32Array(pcm.length);
+  let somme = 0;
+  for (let i = 0; i < pcm.length; i++) {
+    const v = pcm[i] / 32768;
+    f32[i] = v;
+    somme += v * v;
+  }
+  const buf = audioCtx.createBuffer(1, f32.length, 16000);
+  buf.getChannelData(0).set(f32);
+  const src = audioCtx.createBufferSource();
+  src.buffer = buf;
+  src.connect(audioCtx.destination);
+
+  const maintenant = audioCtx.currentTime;
+  // petit coussin de 150 ms : absorbe les à-coups du réseau sans trop retarder
+  if (prochainDepart < maintenant + 0.05) prochainDepart = maintenant + 0.15;
+  src.start(prochainDepart);
+  prochainDepart += buf.duration;
+
+  const rms = Math.sqrt(somme / pcm.length);
+  barre.style.width = Math.min(100, Math.round(Math.sqrt(rms) * 140)) + "%";
+}
+
+bouton.onclick = () => { if (actif || bouton.disabled && ws) arreter("Arrêté."); else demarrer(); };
+champMdp.addEventListener("keydown", (e) => { if (e.key === "Enter") demarrer(); });
+</script>
+</body>
+</html>
