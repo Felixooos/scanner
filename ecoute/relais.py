@@ -42,6 +42,32 @@ ICI = os.path.dirname(os.path.abspath(__file__))
 auditeurs = set()            # WebSockets des navigateurs qui écoutent
 source_actuelle = {"ws": None}   # le Mac, s'il est connecté
 
+# Blocage anti-essais : après trop de mauvais codes depuis une même adresse,
+# on la met en pause. Un code court reste donc impossible à deviner par
+# force brute (sans ça, un robot teste 10000 codes en quelques secondes).
+ECHECS_MAX = 5               # essais ratés avant blocage
+BLOCAGE_SEC = 60            # durée du blocage, qui double à chaque récidive
+_echecs = {}                 # ip -> [nb_echecs, bloquee_jusqua, duree_courante]
+
+
+def _est_bloquee(ip):
+    e = _echecs.get(ip)
+    return bool(e and e[1] > time.time())
+
+
+def _note_echec(ip):
+    e = _echecs.get(ip, [0, 0, BLOCAGE_SEC])
+    e[0] += 1
+    if e[0] >= ECHECS_MAX:
+        e[1] = time.time() + e[2]
+        e[2] = min(e[2] * 2, 3600)     # récidive : blocage de plus en plus long
+        e[0] = 0
+    _echecs[ip] = e
+
+
+def _reset_echec(ip):
+    _echecs.pop(ip, None)
+
 
 async def dire_a_la_source(mot):
     ws = source_actuelle["ws"]
@@ -111,6 +137,12 @@ async def canal_auditeur(requete):
     ws = web.WebSocketResponse(heartbeat=20)
     await ws.prepare(requete)
 
+    ip = requete.remote or "?"
+    if _est_bloquee(ip):
+        await ws.send_str("BLOQUE")
+        await ws.close(code=4029, message=b"trop d'essais, patiente")
+        return ws
+
     try:
         premier = await ws.receive(timeout=10)
     except asyncio.TimeoutError:
@@ -118,9 +150,11 @@ async def canal_auditeur(requete):
         return ws
     mdp = premier.data if premier.type == WSMsgType.TEXT else ""
     if not secrets.compare_digest(mdp or "", MOT_DE_PASSE):
+        _note_echec(ip)
         await ws.send_str("NON")
         await ws.close(code=4003, message=b"mot de passe invalide")
         return ws
+    _reset_echec(ip)
     await ws.send_str("OK")
 
     premier_auditeur = not auditeurs

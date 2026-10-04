@@ -94,7 +94,9 @@ function demarrer() {
         bouton.disabled = false;
         dire("À l'écoute", "#3ba55d");
       } else if (ev.data === "NON") {
-        arreter("Mot de passe refusé.");
+        arreter("Code refusé.");
+      } else if (ev.data === "BLOQUE") {
+        arreter("Trop d'essais — patiente une minute.");
       }
       return;
     }
