@@ -24,6 +24,7 @@
  */
 
 #include <HardwareSerial.h>
+#include <ESP_I2S.h>
 
 HardwareSerial capteur(2);                 // UART2 de l'ESP32
 
@@ -449,9 +450,11 @@ static void attendreAnime(uint32_t ms) {
 /* ---------- programme principal ---------- */
 
 void setup() {
-  // 80 MHz suffisent largement (on ne fait que du serie) : c'est ~35 mA
-  // de moins a fournir pour le regulateur de la carte.
-  setCpuFrequencyMhz(80);
+  // 160 MHz au lieu de 240 : un peu moins de courant pour le regulateur.
+  // PAS 80 : mesure, a 80 MHz la liaison USB a 921600 bauds perd les deux
+  // tiers des caracteres et insere des octets nuls (les images seraient
+  // corrompues). 160 et 240 : zero perte.
+  setCpuFrequencyMhz(160);
   Serial.begin(BAUD_USB);
   pinMode(BROCHE_BOUTON, INPUT_PULLUP);    // bouton entre GPIO et GND
   pwmInit(BROCHE_BLEUE_A, 0);
@@ -790,6 +793,61 @@ static void diagnosticLampe() {
   lampeCapteur(false);
 }
 
+/* ---------- micro I2S (test de cablage) ----------
+ * Micro MEMS I2S (SPH0645) : BCLK 18, LRCL 19, DOUT 23, SEL a la masse
+ * (canal gauche). "MICRO" ecoute 3 secondes, affiche le niveau sonore toutes
+ * les 100 ms, puis libere les broches. Rien d'autre ne touche au micro.
+ */
+static const int BROCHE_MIC_BCLK = 18;
+static const int BROCHE_MIC_WS   = 19;
+static const int BROCHE_MIC_DATA = 23;
+
+static void testMicro() {
+  I2SClass i2s;
+  i2s.setPins(BROCHE_MIC_BCLK, BROCHE_MIC_WS, -1, BROCHE_MIC_DATA);
+  if (!i2s.begin(I2S_MODE_STD, 16000, I2S_DATA_BIT_WIDTH_32BIT,
+                 I2S_SLOT_MODE_MONO, I2S_STD_SLOT_LEFT)) {
+    Serial.println("# MICRO : impossible de demarrer l'I2S.");
+    return;
+  }
+  static int32_t tampon[1600];                   // 100 ms a 16 kHz
+  i2s.readBytes((char *)tampon, sizeof(tampon)); // le micro se reveille : on jette
+  Serial.println("# MICRO : ecoute 3 s (niveau toutes les 100 ms)");
+  uint32_t nuls = 0, total = 0;
+  int32_t mini = 0x7FFFFFFF, maxi = -0x7FFFFFFF;
+  for (int f = 0; f < 30; f++) {
+    size_t n = i2s.readBytes((char *)tampon, sizeof(tampon)) / 4;
+    if (n == 0) continue;
+    double somme = 0, somme2 = 0;
+    for (size_t i = 0; i < n; i++) {
+      int32_t v = tampon[i] >> 14;               // 18 bits utiles
+      if (tampon[i] == 0) nuls++;
+      if (v < mini) mini = v;
+      if (v > maxi) maxi = v;
+      somme += v;
+      somme2 += (double)v * v;
+    }
+    total += n;
+    double moyenne = somme / n;
+    double rms = sqrt(fmax(somme2 / n - moyenne * moyenne, 0.0));
+    int barres = (int)constrain(log10(rms + 1.0) * 8.0, 0.0, 40.0);
+    Serial.print("#   ");
+    Serial.print((int)rms);
+    Serial.print("\t");
+    for (int b = 0; b < barres; b++) Serial.print('|');
+    Serial.println();
+  }
+  i2s.end();
+  if (total == 0)
+    Serial.println("# MICRO : aucune donnee recue -> verifie BCLK (18) et LRCL (19).");
+  else if (nuls == total)
+    Serial.println("# MICRO : que des zeros -> verifie DOUT (23), 3V et GND du micro.");
+  else if (maxi == mini)
+    Serial.println("# MICRO : valeur figee -> verifie SEL a la masse et LRCL (19).");
+  else
+    Serial.println("# MICRO : OK, le micro capte du son.");
+}
+
 static void entrerVeille() {
   if (enVeille) return;
   enVeille = true;
@@ -838,6 +896,7 @@ void loop() {
       else if (ordre.equalsIgnoreCase("DIAG")) diagnostic();
       else if (ordre.equalsIgnoreCase("DIAGTCH")) diagnosticToucher();
       else if (ordre.equalsIgnoreCase("DIAGLED")) diagnosticLampe();
+      else if (ordre.equalsIgnoreCase("MICRO")) testMicro();
       else if (ordre.equalsIgnoreCase("TEMP")) {
         if (!SONDE_TEMP) Serial.println("# Pas de sonde de temperature cablee (SONDE_TEMP = false).");
         else { Serial.print("# Temperature du regulateur : ");
