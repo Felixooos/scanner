@@ -15,7 +15,8 @@
  *   broche 3  RX       -> GPIO 17 (TX2)
  *   broche 4  GND      -> GND
  *   broche 5  Touch    -> GPIO 4 (detection du doigt, conseille !)
- *   broche 6  TouchVin -> 3V3 (obligatoire si Touch est branché)
+ *   broche 6  TouchVin -> 3V3 (obligatoire si Touch est branché) ; sur ce
+ *             montage elle est RELIEE a la broche 1, et le GPIO 32 reste LIBRE
  *   broche 7  D+ USB   -> non branché
  *   broche 8  D- USB   -> non branché
  * La broche 1 est repérée sur le connecteur du module (le fil rouge
@@ -277,6 +278,53 @@ static bool doigtArme = true;      // false = doigt pas encore relache (anti-rep
 // Veille (declarees ici : setup() s'en sert, et l'Arduino exige que les
 // variables soient connues AVANT leur premiere utilisation).
 static const uint32_t SILENCE_VEILLE = 30000;   // ms de silence du Mac
+
+// Lampe du capteur : allumee UNIQUEMENT pendant une prise. Eteinte, le
+// capteur consomme deux a trois fois moins, et le regulateur 3,3 V de la
+// carte (qui a deja grille une fois) reste tiede.
+static bool capteurOk = false;                  // detecte au demarrage
+static bool lampeAllumee = false;
+static uint32_t lampeDepuis = 0;
+static const uint32_t LAMPE_MAXI = 20000;       // garde-fou : jamais plus
+static void lampeCapteur(bool allumee);         // (definie plus bas)
+
+/* ---------- alimentation du circuit tactile (VA) ----------
+ * Sur ce montage, les fils V+ et VA du capteur sont RELIES ENSEMBLE et vont
+ * au 3V3 : le tactile est alimente en permanence, et le GPIO 32 ne doit
+ * rien piloter. S'il etait relie a ce noeud, le mettre a LOW court-
+ * circuiterait le 3,3 V a travers la broche. Tant que VA_PILOTEE est false,
+ * la broche reste en entree (haute impedance) : meme un fil oublie dessus
+ * est inoffensif.
+ */
+static const bool VA_PILOTEE = false;
+static void alimTactile(bool allumee) {
+  if (!VA_PILOTEE) { pinMode(BROCHE_VA, INPUT); return; }
+  pinMode(BROCHE_VA, OUTPUT);
+  digitalWrite(BROCHE_VA, allumee ? HIGH : LOW);
+}
+
+/* ---------- sonde de temperature sur le regulateur ----------
+ * Un TMP36 colle contre le regulateur 3,3 V de la carte (celui qui a deja
+ * grille une fois). S'il chauffe trop, on met le capteur en securite avant
+ * que la carte ne souffre, et on previent le Mac. Cablage du TMP36, face
+ * plate vers soi, pattes de gauche a droite : +Vs -> 3V3, Vout -> GPIO 34,
+ * GND -> GND. Passer SONDE_TEMP a true UNE FOIS la sonde cablee : sans elle,
+ * la broche flotte et lirait n'importe quoi.
+ */
+static const bool  SONDE_TEMP   = false;
+static const int   BROCHE_TEMP  = 34;           // entree seule, ADC1
+static const float TEMP_ALERTE  = 75.0;         // degres C : on coupe
+static const float TEMP_REPRISE = 55.0;         // degres C : on reprend
+static bool  surchauffe = false;
+static float derniereTemp = 0.0;
+static uint32_t derniereLectureTemp = 0, dernierRapportTemp = 0;
+
+// Moyenne de 8 lectures, en degres. TMP36 : 500 mV a 0 C, 10 mV par degre.
+static float lireTemperature() {
+  uint32_t somme = 0;
+  for (int i = 0; i < 8; i++) somme += analogReadMilliVolts(BROCHE_TEMP);
+  return (somme / 8.0f - 500.0f) / 10.0f;
+}
 static bool enVeille = false;
 static uint32_t dernierMot = 0;                 // date du dernier octet recu
 static EtatLed etatLed = ETAT_DEMARRAGE;
@@ -401,6 +449,9 @@ static void attendreAnime(uint32_t ms) {
 /* ---------- programme principal ---------- */
 
 void setup() {
+  // 80 MHz suffisent largement (on ne fait que du serie) : c'est ~35 mA
+  // de moins a fournir pour le regulateur de la carte.
+  setCpuFrequencyMhz(80);
   Serial.begin(BAUD_USB);
   pinMode(BROCHE_BOUTON, INPUT_PULLUP);    // bouton entre GPIO et GND
   pwmInit(BROCHE_BLEUE_A, 0);
@@ -411,8 +462,8 @@ void setup() {
   changerEtat(ETAT_DEMARRAGE);
   animerLeds();
   pinMode(BROCHE_TOUCH, INPUT_PULLDOWN);   // TCH non branché -> lit toujours 0
-  pinMode(BROCHE_VA, OUTPUT);
-  digitalWrite(BROCHE_VA, HIGH);           // alimente le circuit tactile (VA)
+  alimTactile(true);                       // (inerte si VA est relie au 3V3)
+  if (SONDE_TEMP) analogSetPinAttenuation(BROCHE_TEMP, ADC_11db);
   capteur.setRxBufferSize(4096);
   capteur.begin(BAUD_CAPTEUR, SERIAL_8N1, BROCHE_RX2, BROCHE_TX2);
   delay(300);
@@ -423,6 +474,8 @@ void setup() {
   int code = connecterCapteur();
   if (code == 0x00) {
     Serial.println("# Capteur detecte, tout est pret.");
+    capteurOk = true;
+    lampeCapteur(false);                   // lampe a la demande seulement
     etatApres = ETAT_PRET;
     changerEtat(ETAT_OK);                  // petit flash vert de bienvenue
   } else {
@@ -440,7 +493,13 @@ void setup() {
 
 // Tente la capture pendant 10 s, puis transfere l'image.
 void lancerScan() {
+  if (surchauffe) {
+    Serial.println("# Scan refuse : le regulateur est trop chaud, on laisse refroidir.");
+    Serial.println("<SCAN_FAIL>");
+    return;
+  }
   Serial.println("# Scan lance : pose ton doigt !");
+  lampeCapteur(true);
   doigtArme = false;      // pas de nouveau declenchement tant qu'on n'a pas retire le doigt
   etatApres = ETAT_PRET;
   changerEtat(ETAT_ATTENTE);               // orange : pose ton doigt
@@ -475,6 +534,7 @@ void lancerScan() {
         etatApres = ETAT_PRET;
         changerEtat(ETAT_ERREUR);
       }
+      lampeCapteur(false);
       return;
     }
     if (code == 0x02) pasDeDoigt++;                // capteur : "pas de doigt"
@@ -486,6 +546,7 @@ void lancerScan() {
         Serial.println("# Capteur muet, tentative de reveil...");
         if (connecterCapteur() == 0x00) {
           Serial.println("# Capteur revenu, scan toujours en cours !");
+          capteurOk = true;
         }
       }
     }
@@ -509,6 +570,7 @@ void lancerScan() {
     Serial.println("# Capteur bloque ? Coupe son fil GND 2 secondes, rebranche, et rescanne.");
   }
   Serial.println("<SCAN_FAIL>");
+  lampeCapteur(false);
   etatApres = ETAT_PRET;
   changerEtat(ETAT_ERREUR);
 }
@@ -596,6 +658,7 @@ static void testLeds() {
 static const uint32_t DELAI_POSE = 1500;   // temps de stabilisation (ms)
 
 static void surveillerToucher() {
+  if (surchauffe) return;                  // capteur en securite
   if (digitalRead(BROCHE_TOUCH) != HIGH) { // plus de doigt : on rearme
     doigtArme = true;
     return;
@@ -610,6 +673,7 @@ static void surveillerToucher() {
   }
   doigtArme = false;                       // un seul declenchement par pose
   Serial.println("# TCH: contact stable, verification...");
+  lampeCapteur(true);                      // le capteur optique a besoin de voir
 
   // Verification : le TCH est juste un detecteur de contact (un chiffon le
   // declenche aussi). On demande donc au capteur OPTIQUE s'il voit vraiment
@@ -621,6 +685,7 @@ static void surveillerToucher() {
       Serial.print("# TCH: contact retire pendant la verification (essai ");
       Serial.print(essai + 1);
       Serial.println(")");
+      lampeCapteur(false);
       return;
     }
     dernier = capturerImage();
@@ -655,6 +720,7 @@ static void surveillerToucher() {
   Serial.println(dernierModele == 6 || dernierModele == 7
                  ? " -> pas de cretes : ce n'est pas un doigt)"
                  : ")");
+  lampeCapteur(false);
 }
 
 /* ---------- veille ----------
@@ -689,6 +755,9 @@ static int dialecteLampe = -1;      // 0 = aucun, 1 = 0x50/0x51, 2 = aura
 
 // Eteint (ou rallume) la lampe avec le dialecte qui marche sur CE module.
 static void lampeCapteur(bool allumee) {
+  if (!capteurOk) return;                          // pas de capteur : rien
+  lampeAllumee = allumee;
+  lampeDepuis = millis();
   if (dialecteLampe == 0) return;                  // module muet la-dessus
   if (dialecteLampe == 1) { lampeSimple(allumee); return; }
   if (dialecteLampe == 2) { lampeAura(allumee); return; }
@@ -718,13 +787,14 @@ static void diagnosticLampe() {
   Serial.println(a == 0 || b == 0 ? "# -> dialecte SIMPLE accepte."
                  : (c == 0 || d == 0 ? "# -> dialecte AURA accepte."
                                      : "# -> aucun : il faudra couper le 3V3."));
+  lampeCapteur(false);
 }
 
 static void entrerVeille() {
   if (enVeille) return;
   enVeille = true;
   lampeCapteur(false);                          // lampe du capteur eteinte
-  digitalWrite(BROCHE_VA, LOW);                 // circuit tactile eteint
+  alimTactile(false);                           // circuit tactile eteint
   rgb(0, 0, 0);
   bleues(0, 0);
   Serial.println("# veille : capteur eteint, en attente de l'app.");
@@ -733,12 +803,11 @@ static void entrerVeille() {
 static void sortirVeille() {
   if (!enVeille) return;
   enVeille = false;
-  digitalWrite(BROCHE_VA, HIGH);
-  delay(60);
-  lampeCapteur(true);                           // on rallume la lampe                                    // le tactile se stabilise
+  alimTactile(true);
+  delay(60);                                    // le tactile se stabilise
   doigtArme = true;                             // pas de faux declenchement
   changerEtat(ETAT_PRET);
-  Serial.println("# reveil : capteur rallume.");
+  Serial.println("# reveil : capteur pret (lampe a la demande).");
 }
 
 // Bouton : anti-rebond simple, un seul evenement par appui.
@@ -769,6 +838,11 @@ void loop() {
       else if (ordre.equalsIgnoreCase("DIAG")) diagnostic();
       else if (ordre.equalsIgnoreCase("DIAGTCH")) diagnosticToucher();
       else if (ordre.equalsIgnoreCase("DIAGLED")) diagnosticLampe();
+      else if (ordre.equalsIgnoreCase("TEMP")) {
+        if (!SONDE_TEMP) Serial.println("# Pas de sonde de temperature cablee (SONDE_TEMP = false).");
+        else { Serial.print("# Temperature du regulateur : ");
+               Serial.print(lireTemperature(), 1); Serial.println(" C"); }
+      }
       else if (ordre.equalsIgnoreCase("TESTLED")) testLeds();
       else if (ordre.startsWith("LED ") || ordre.startsWith("led ")) {
         String mot = ordre.substring(4);
@@ -781,6 +855,39 @@ void loop() {
       ordre += c;
     }
   }
+  // Sonde : toutes les 2 s. Trop chaud -> capteur en securite ; on ne
+  // reprend qu'apres un vrai refroidissement (hysteresis de 20 degres).
+  if (SONDE_TEMP && millis() - derniereLectureTemp > 2000) {
+    derniereLectureTemp = millis();
+    float t = lireTemperature();
+    if (t > -20.0f && t < 150.0f) {          // sinon la sonde debloque : on ignore
+      derniereTemp = t;
+      if (!surchauffe && t >= TEMP_ALERTE) {
+        surchauffe = true;
+        lampeCapteur(false);
+        alimTactile(false);
+        Serial.print("# SURCHAUFFE : regulateur a "); Serial.print(t, 0);
+        Serial.println(" C, capteur mis en securite.");
+        Serial.print("<SURCHAUFFE "); Serial.print(t, 0); Serial.println(">");
+      } else if (surchauffe && t <= TEMP_REPRISE) {
+        surchauffe = false;
+        if (!enVeille) alimTactile(true);
+        doigtArme = true;
+        Serial.print("# Temperature redescendue a "); Serial.print(t, 0);
+        Serial.println(" C, capteur reactive.");
+        Serial.println("<TEMP_OK>");
+      }
+      if (millis() - dernierRapportTemp > 30000) {  // point regulier
+        dernierRapportTemp = millis();
+        Serial.print("# temperature regulateur : "); Serial.print(t, 0); Serial.println(" C");
+        if (surchauffe) { Serial.print("<SURCHAUFFE "); Serial.print(t, 0); Serial.println(">"); }
+      }
+    }
+  }
+
+  // Lampe restee allumee (le Mac n'a pas envoye SCAN) : on l'eteint.
+  if (lampeAllumee && millis() - lampeDepuis > LAMPE_MAXI) lampeCapteur(false);
+
   // App fermee (ou plantee) : on s'eteint tout seul au bout d'un silence.
   if (!enVeille && millis() - dernierMot > SILENCE_VEILLE) entrerVeille();
 

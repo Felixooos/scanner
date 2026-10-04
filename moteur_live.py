@@ -210,6 +210,14 @@ def _ecouteur_bouton():
             envoyer(event="bouton")
         elif ligne.startswith("<TOUCHE>"):
             envoyer(event="touche")      # doigt posé : scan immédiat
+        elif ligne.startswith("<SURCHAUFFE"):
+            degres = "".join(c for c in ligne if c.isdigit()) or "?"
+            envoyer(event="error", raison=(
+                f"⚠️ Le régulateur de l'ESP32 est à {degres} °C : capteur mis en "
+                "sécurité. Laisse refroidir, vérifie que le boîtier respire."))
+        elif ligne.startswith("<TEMP_OK>"):
+            envoyer(event="status",
+                    texte="Température redevenue normale, capteur réactivé.")
 
 
 def _nom_fichier(texte):
