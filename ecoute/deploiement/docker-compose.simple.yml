@@ -1,0 +1,16 @@
+# Mode FAINÉANT : IP directe, SANS HTTPS. Le son et le mot de passe passent
+# EN CLAIR sur internet — à n'utiliser que si tu assumes ce risque.
+#     docker compose -f docker-compose.simple.yml up -d --build
+# Puis ouvre http://<IP_DU_VPS>:8787  (pense à ouvrir le port 8787 au pare-feu)
+# Le Mac se connecte à :  ws://<IP_DU_VPS>:8787/source
+services:
+  relais:
+    build:
+      context: ..
+      dockerfile: deploiement/Dockerfile
+    restart: unless-stopped
+    environment:
+      ECOUTE_MOT_DE_PASSE: ${ECOUTE_MOT_DE_PASSE:?defini-le-dans-.env}
+      ECOUTE_JETON_SOURCE: ${ECOUTE_JETON_SOURCE:?defini-le-dans-.env}
+    ports:
+      - "8787:8787"
