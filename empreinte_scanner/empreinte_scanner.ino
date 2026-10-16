@@ -31,7 +31,8 @@ HardwareSerial capteur(2);                 // UART2 de l'ESP32
 
 static const int  BROCHE_RX2   = 16;       // relié au TX du capteur
 static const int  BROCHE_TX2   = 17;       // relié au RX du capteur
-static const int  BROCHE_TOUCH = 4;        // relié au TCH du capteur (haut = doigt)
+static const int  BROCHE_TOUCH = 22;       // TCH du capteur (haut = doigt). PAS 1 :
+                                           // GPIO 1 = TX de l'USB vers le Mac.
 static const int  BROCHE_VA    = 32;       // sortie 3,3 V pour le VA du capteur
                                            // (si la broche 3V3 est deja prise)
 static const uint32_t BAUD_CAPTEUR = 57600;   // vitesse STABLE du capteur
@@ -805,13 +806,16 @@ static void diagnosticLampe() {
  * (canal gauche). "MICRO" ecoute 3 secondes, affiche le niveau sonore toutes
  * les 100 ms, puis libere les broches. Rien d'autre ne touche au micro.
  */
-static const int BROCHE_MIC_BCLK = 18;
-static const int BROCHE_MIC_WS   = 19;
-static const int BROCHE_MIC_DATA = 23;
+static const int BROCHE_MIC_BCLK = 18;   // BCLK
+static const int BROCHE_MIC_WS   = 19;   // LRCL
+static const int BROCHE_MIC_DATA = 5;    // DOUT
+// Copie modifiable a chaud par "MICPINS <bclk> <lrcl> <dout>" (diagnostic
+// de cablage, non sauvegarde : au redemarrage on revient aux constantes).
+static int micBclk = BROCHE_MIC_BCLK, micWs = BROCHE_MIC_WS, micData = BROCHE_MIC_DATA;
 
 static void testMicro() {
   I2SClass i2s;
-  i2s.setPins(BROCHE_MIC_BCLK, BROCHE_MIC_WS, -1, BROCHE_MIC_DATA);
+  i2s.setPins(micBclk, micWs, -1, micData);
   if (!i2s.begin(I2S_MODE_STD, 16000, I2S_DATA_BIT_WIDTH_32BIT,
                  I2S_SLOT_MODE_MONO, I2S_STD_SLOT_LEFT)) {
     Serial.println("# MICRO : impossible de demarrer l'I2S.");
@@ -846,11 +850,11 @@ static void testMicro() {
   }
   i2s.end();
   if (total == 0)
-    Serial.println("# MICRO : aucune donnee recue -> verifie BCLK (18) et LRCL (19).");
+    Serial.printf("# MICRO : aucune donnee recue -> verifie BCLK (%d) et LRCL (%d).\n", micBclk, micWs);
   else if (nuls == total)
-    Serial.println("# MICRO : que des zeros -> verifie DOUT (23), 3V et GND du micro.");
+    Serial.printf("# MICRO : que des zeros -> verifie DOUT (%d), 3V et GND du micro.\n", micData);
   else if (maxi == mini)
-    Serial.println("# MICRO : valeur figee -> verifie SEL a la masse et LRCL (19).");
+    Serial.printf("# MICRO : valeur figee -> verifie SEL a la masse et LRCL (%d).\n", micWs);
   else
     Serial.println("# MICRO : OK, le micro capte du son.");
 }
@@ -871,7 +875,7 @@ static const uint32_t SILENCE_ECOUTE = 15000;
 
 static void demarrerEcoute() {
   if (enEcoute) return;
-  micro.setPins(BROCHE_MIC_BCLK, BROCHE_MIC_WS, -1, BROCHE_MIC_DATA);
+  micro.setPins(micBclk, micWs, -1, micData);
   if (!micro.begin(I2S_MODE_STD, 16000, I2S_DATA_BIT_WIDTH_32BIT,
                    I2S_SLOT_MODE_MONO, I2S_STD_SLOT_LEFT)) {
     Serial.println("# ECOUTE : impossible de demarrer le micro.");
@@ -967,6 +971,13 @@ void loop() {
       else if (ordre.equalsIgnoreCase("DIAGTCH")) diagnosticToucher();
       else if (ordre.equalsIgnoreCase("DIAGLED")) diagnosticLampe();
       else if (ordre.equalsIgnoreCase("MICRO")) { if (!enEcoute) testMicro(); }
+      else if (ordre.startsWith("MICPINS ") && !enEcoute) {
+        int b, w, d;
+        if (sscanf(ordre.c_str() + 8, "%d %d %d", &b, &w, &d) == 3) {
+          micBclk = b; micWs = w; micData = d;
+          Serial.printf("# MICPINS : BCLK=%d LRCL=%d DOUT=%d\n", b, w, d);
+        }
+      }
       else if (ordre.equalsIgnoreCase("TEMP")) {
         if (!SONDE_TEMP) Serial.println("# Pas de sonde de temperature cablee (SONDE_TEMP = false).");
         else { Serial.print("# Temperature du regulateur : ");
