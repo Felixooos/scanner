@@ -93,11 +93,15 @@ Utilisation :
 
 - Branche le capteur d'empreintes en USB AVANT d'ouvrir l'app.
 - Ouvre Empreinte : la pastille en haut à droite doit dire « Capteur prêt ».
-- « Nouvelle commande » > ajoute une empreinte par personne > pose le doigt
-  sur le capteur (le scan démarre tout seul, recommence en décalant un peu
-  le doigt) > « Terminer » > ajuste le cadre > « Valider l'empreinte ».
-- Choisis ensuite une forme (cœur, trèfle…) et un style pour voir le rendu,
-  puis « Enregistrer le rendu » et « Exporter » pour tout envoyer.
+- « Nouvelle commande » > tape le nom du client.
+- 1. Empreintes : « + » pour chaque personne > pose le doigt sur le
+  capteur (le scan démarre tout seul ; repose-le un peu décalé : chaque
+  pose complète la précédente et efface les taches) > « C'est bon, ajuster
+  le cadre » > « Valider l'empreinte ».
+- 2. Composition : choisis la forme (cœur, trèfle…) et le style, place et
+  tourne chaque empreinte, puis « Enregistrer le rendu ».
+- 3. Envoi : « Préparer le dossier à envoyer » > « Envoyer par mail »
+  (un dossier au nom du client, un sous-dossier par empreinte, en zip).
 
 Les commandes sont rangées dans ~/Documents/Empreintes MMD
 (modifiable dans l'app : roue dentée en haut à droite).
