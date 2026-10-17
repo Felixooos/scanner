@@ -52,7 +52,8 @@ struct FeuilleExport: View {
                 }
                 ArbreFichiers(lignes: resultat?.relatifs ?? Export.arborescencePrevue(moteur),
                               racine: resultat?.nomExport ?? moteur.nomCommande,
-                              enCours: moteur.exportEnCours)
+                              enCours: moteur.exportEnCours,
+                              empreintes: moteur.empreintes.map { ($0.index, $0.nom) })
             }
             .padding(16 * echelle)
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -175,7 +176,15 @@ struct ArbreFichiers: View {
     let lignes: [String]
     let racine: String
     var enCours: Bool = false
+    /// (index, prénom) des empreintes : leur dossier prend leur couleur.
+    var empreintes: [(Int, String)] = []
     @Environment(\.echelle) private var echelle
+
+    /// L'empreinte dont `nom` est le dossier (« Louis », « Louis (2) »…).
+    private func empreinte(pourDossier nom: String) -> Int? {
+        let n = nom.lowercased()
+        return empreintes.first { n == $0.1.lowercased() || n.hasPrefix($0.1.lowercased() + " (") }?.0
+    }
 
     var body: some View {
         let arbre = Noeud.construire(lignes)
@@ -204,12 +213,18 @@ struct ArbreFichiers: View {
                 }
                 .frame(height: 16 * echelle)
             }
-            Image(systemName: symbole(nom, dossier: dossier))
-                .police(12, dossier ? .bold : .medium)
-                .foregroundColor(dossier ? MMD.doreFonce : teinte(nom))
-                .frame(width: 16 * echelle)
+            let e = (dossier && !racine && profondeur == 1) ? empreinte(pourDossier: nom) : nil
+            if let e {
+                NumeroEmpreinte(index: e, taille: 16)
+            } else {
+                Image(systemName: symbole(nom, dossier: dossier))
+                    .police(12, dossier ? .bold : .medium)
+                    .foregroundColor(dossier ? MMD.doreFonce : teinte(nom))
+                    .frame(width: 16 * echelle)
+            }
             Text(nom).police(racine ? 12.5 : 12, racine || dossier ? .heavy : .medium)
-                .foregroundColor(MMD.encre).lineLimit(1).truncationMode(.middle)
+                .foregroundColor(e.map { TeinteEmpreinte.pour($0).fonce } ?? MMD.encre)
+                .lineLimit(1).truncationMode(.middle)
             if racine && enCours {
                 Logo(taille: 12, tourne: true, encre: MMD.gris, drapeau: false)
             }

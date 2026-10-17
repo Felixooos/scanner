@@ -421,6 +421,62 @@ struct TitreSection: View {
     }
 }
 
+/// La couleur fixe de chaque empreinte, partout dans l'app (1 rose poudré,
+/// 2 bleu dragée, 3 vert sauge, 4 doré) : on sait toujours qui est qui.
+struct TeinteEmpreinte {
+    let fonce: Color      // texte, contours
+    let moyen: Color      // traits, poignées
+    let clair: Color      // fonds
+    let nom: String
+
+    static func pour(_ index: Int) -> TeinteEmpreinte {
+        switch ((index % 4) + 4) % 4 {
+        case 0:  return TeinteEmpreinte(fonce: MMD.roseFonce, moyen: MMD.rose, clair: MMD.roseClair, nom: "rose")
+        case 1:  return TeinteEmpreinte(fonce: MMD.drageeFonce, moyen: MMD.dragee, clair: MMD.drageeClair, nom: "dragée")
+        case 2:  return TeinteEmpreinte(fonce: MMD.vert, moyen: MMD.vert.opacity(0.55), clair: MMD.vertClair, nom: "sauge")
+        default: return TeinteEmpreinte(fonce: MMD.doreFonce, moyen: MMD.dore, clair: MMD.doreClair, nom: "doré")
+        }
+    }
+}
+
+/// Pastille ronde numérotée, de la couleur de l'empreinte.
+struct NumeroEmpreinte: View {
+    let index: Int
+    var taille: CGFloat = 24
+    @Environment(\.echelle) private var echelle
+    var body: some View {
+        let t = TeinteEmpreinte.pour(index)
+        Text("\(index + 1)")
+            .police(taille * 0.48, .heavy).foregroundColor(.white)
+            .frame(width: taille * echelle, height: taille * echelle)
+            .background(Circle().fill(t.fonce))
+            .overlay(Circle().strokeBorder(.white.opacity(0.7), lineWidth: 1.2 * echelle))
+    }
+}
+
+/// Étiquette « 1 · Louis » aux couleurs de l'empreinte.
+struct EtiquetteEmpreinte: View {
+    let index: Int
+    let nom: String
+    var pleine: Bool = false       // fond foncé (sur l'aperçu) ou clair (dans une carte)
+    @Environment(\.echelle) private var echelle
+    var body: some View {
+        let t = TeinteEmpreinte.pour(index)
+        HStack(spacing: 5 * echelle) {
+            Text("\(index + 1)").police(10.5, .heavy)
+                .frame(width: 17 * echelle, height: 17 * echelle)
+                .background(Circle().fill(pleine ? .white.opacity(0.25) : t.fonce))
+                .foregroundColor(.white)
+            Text(nom).police(11.5, .heavy).foregroundColor(pleine ? .white : t.fonce).lineLimit(1)
+        }
+        .padding(.leading, 3 * echelle).padding(.trailing, 9 * echelle).padding(.vertical, 3 * echelle)
+        .background(Capsule().fill(pleine ? t.fonce : t.clair)
+            .overlay(Capsule().strokeBorder(t.fonce.opacity(pleine ? 0 : 0.35), lineWidth: 1 * echelle)))
+        .compositingGroup()
+        .shadow(color: MMD.encre.opacity(pleine ? 0.18 : 0), radius: 4 * echelle, y: 2 * echelle)
+    }
+}
+
 /// Fin trait tricolore : le clin d'œil au drapeau, à utiliser avec parcimonie.
 struct Tricolore: View {
     var largeur: CGFloat = 54
@@ -583,16 +639,51 @@ struct FormeIcone: View {
                     ctx.stroke(Path(ellipseIn: CGRect(x: p.x - r, y: p.y - r, width: 2 * r, height: 2 * r)),
                                with: .color(encre), style: style)
                 }
+            case "ovale_lr":
+                // un ovale coupé en deux moitiés gauche / droite
+                let ry = u * 0.44, rx = ry * 0.8
+                ctx.stroke(Path(ellipseIn: CGRect(x: c.x - rx, y: c.y - ry, width: 2 * rx, height: 2 * ry)),
+                           with: .color(encre), style: style)
+                var fente = Path()
+                fente.move(to: CGPoint(x: c.x, y: c.y - ry * 0.92))
+                fente.addLine(to: CGPoint(x: c.x, y: c.y + ry * 0.92))
+                ctx.stroke(fente, with: .color(encre.opacity(0.45)),
+                           style: StrokeStyle(lineWidth: epaisseur * 0.8, lineCap: .round, dash: [2, 3]))
+            case "tete_beche":
+                // moitié haute et moitié basse (celle du bas retournée)
+                let ry = u * 0.44, rx = ry * 0.8
+                ctx.stroke(Path(ellipseIn: CGRect(x: c.x - rx, y: c.y - ry, width: 2 * rx, height: 2 * ry)),
+                           with: .color(encre), style: style)
+                var fente = Path()
+                fente.move(to: CGPoint(x: c.x - rx * 0.92, y: c.y))
+                fente.addLine(to: CGPoint(x: c.x + rx * 0.92, y: c.y))
+                ctx.stroke(fente, with: .color(encre.opacity(0.45)),
+                           style: StrokeStyle(lineWidth: epaisseur * 0.8, lineCap: .round, dash: [2, 3]))
+                // deux petites flèches opposées : l'une monte, l'autre descend
+                for (sy, y) in [(CGFloat(-1), c.y - ry * 0.5), (CGFloat(1), c.y + ry * 0.5)] {
+                    var f = Path()
+                    f.move(to: CGPoint(x: c.x - u * 0.05, y: y + sy * u * 0.05))
+                    f.addLine(to: CGPoint(x: c.x, y: y - sy * u * 0.03))
+                    f.addLine(to: CGPoint(x: c.x + u * 0.05, y: y + sy * u * 0.05))
+                    ctx.stroke(f, with: .color(encre.opacity(0.6)), style: style)
+                }
             default:
+                // « séparées » : une médaille ronde par empreinte
                 let n = max(1, min(4, nb))
-                let ry = u * (n == 1 ? 0.42 : 0.30)
-                let rx = ry * 0.8
-                let pas = rx * 2.25
-                let x0 = c.x - pas * CGFloat(n - 1) / 2
+                let r = u * (n == 1 ? 0.40 : (n == 2 ? 0.22 : 0.17))
+                let pas = r * 2.35
+                let colonnes = n <= 2 ? n : 2
+                let lignes = n <= 2 ? 1 : 2
                 for i in 0..<n {
-                    let x = x0 + pas * CGFloat(i)
-                    ctx.stroke(Path(ellipseIn: CGRect(x: x - rx, y: c.y - ry, width: 2 * rx, height: 2 * ry)),
+                    let col = CGFloat(i % colonnes), lig = CGFloat(i / colonnes)
+                    let x = c.x - pas * CGFloat(colonnes - 1) / 2 + pas * col
+                    let y = c.y - pas * CGFloat(lignes - 1) / 2 + pas * lig
+                    ctx.stroke(Path(ellipseIn: CGRect(x: x - r, y: y - r, width: 2 * r, height: 2 * r)),
                                with: .color(encre), style: style)
+                    let ri = r * 0.55
+                    ctx.stroke(Path(ellipseIn: CGRect(x: x - ri * 0.8, y: y - ri, width: 2 * ri * 0.8, height: 2 * ri)),
+                               with: .color(encre.opacity(0.45)),
+                               style: StrokeStyle(lineWidth: epaisseur * 0.7, dash: [1.5, 2]))
                 }
             }
         }
@@ -690,7 +781,7 @@ struct Medaille<Contenu: View>: View {
                 .strokeBorder(MMD.doreFonce.opacity(0.35), lineWidth: max(0.8, diametre * 0.012))
                 .padding(diametre * 0.045)
             contenu()
-                .padding(diametre * 0.13)
+                .frame(width: diametre * 0.88, height: diametre * 0.88)
                 .clipShape(Circle())
         }
         .frame(width: diametre, height: diametre)
@@ -718,32 +809,40 @@ enum TailleReelle {
 
 /// Libellés lisibles des formes et styles.
 enum Libelle {
+    /// Les formes qu'on peut assembler (clé moteur). « simple » (ancien) = séparées.
+    static let formesAssemblees: Set<String> = ["coeur", "ovale_lr", "tete_beche", "trefle"]
+
     static func forme(_ cle: String?, nb: Int = 0) -> String? {
         switch cle {
-        case "coeur":  return "Cœur"
-        case "trefle": return nb >= 3 ? "Trèfle \(min(nb, 4))" : "Trèfle"
-        case "simple": return nb > 1 ? "Côte à côte" : "Simple"
-        default:       return nil
+        case "coeur":                return "Cœur"
+        case "ovale_lr":             return "Ovale coupé"
+        case "tete_beche":           return "Tête-bêche"
+        case "trefle":               return nb >= 3 ? "Trèfle \(min(nb, 4))" : "Trèfle"
+        case "separees", "simple":   return nb > 1 ? "Séparées" : "Simple"
+        default:                     return nil
         }
     }
     static func style(_ cle: String?) -> String? {
         Moteur.styles.first { $0.cle == cle }?.nom
     }
     /// Le libellé de forme tel que le moteur nomme les fichiers exportés
-    /// (PROTOCOLE_V2 : `Simple`, `Cœur`, `Trèfle 3`, `Trèfle 4`).
+    /// (PROTOCOLE_V2 : `Simple`, `Cœur`, `Trèfle 3`, `Trèfle 4`…).
     static func formeFichier(_ cle: String?, nb: Int) -> String? {
         switch cle {
-        case "coeur":  return "Cœur"
-        case "trefle": return "Trèfle \(max(3, min(nb, 4)))"
-        case "simple": return "Simple"
-        default:       return nil
+        case "coeur":      return "Cœur"
+        case "ovale_lr":   return "Ovale coupé"
+        case "tete_beche": return "Tête-bêche"
+        case "trefle":     return "Trèfle \(max(3, min(nb, 4)))"
+        default:           return nil          // séparées : pas de rendu assemblé
         }
     }
     static func symboleForme(_ cle: String?) -> String {
         switch cle {
-        case "coeur":  return "heart"
-        case "trefle": return "leaf"
-        default:       return "oval"
+        case "coeur":      return "heart"
+        case "trefle":     return "leaf"
+        case "ovale_lr":   return "rectangle.split.2x1"
+        case "tete_beche": return "rectangle.split.1x2"
+        default:           return "circle.grid.2x2"
         }
     }
     static func pluriel(_ n: Int, _ mot: String) -> String {

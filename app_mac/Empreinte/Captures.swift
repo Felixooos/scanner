@@ -86,11 +86,19 @@ enum Captures {
         liste.append(("02_accueil", m.accueil(vide: false)))
         liste.append(("03_commande_vide", m.commande(nb: 0, etape: .empreintes)))
         liste.append(("04_commande_empreintes", m.commande(nb: 2, etape: .empreintes)))
-        liste.append(("05_commande_composition", m.commande(nb: 2, etape: .composition,
-                                                             forme: "coeur", placement: 1)))
-        liste.append(("06_commande_composition_trefle", m.commande(nb: 3, etape: .composition,
-                                                                    forme: "trefle", style: "sans",
-                                                                    tailleReelle: true)))
+        liste.append(("05_composition_chaque", m.commande(nb: 2, etape: .composition, forme: "separees")))
+        liste.append(("05b_composition_detail", m.commande(nb: 2, etape: .composition, forme: "separees",
+                                                           detail: 0)))
+        liste.append(("06_assembler_coeur", m.commande(nb: 2, etape: .composition, forme: "coeur",
+                                                       placement: 1, vue: .assembler)))
+        liste.append(("06b_assembler_ovale", m.commande(nb: 2, etape: .composition, forme: "ovale_lr",
+                                                        tailleReelle: true, vue: .assembler)))
+        liste.append(("06c_assembler_tete_beche", m.commande(nb: 2, etape: .composition, forme: "tete_beche",
+                                                             placement: 0, vue: .assembler)))
+        liste.append(("06d_assembler_trefle", m.commande(nb: 3, etape: .composition, forme: "trefle",
+                                                         style: "sans", placement: 2, vue: .assembler)))
+        liste.append(("06e_assembler_separees", m.commande(nb: 2, etape: .composition, forme: "separees",
+                                                           vue: .assembler)))
         liste.append(("07_commande_envoi", m.commande(nb: 2, etape: .envoi, forme: "coeur")))
         liste.append(("08_commande_envoi_pret", m.commande(nb: 2, etape: .envoi, forme: "coeur",
                                                             exporte: true)))
@@ -147,7 +155,16 @@ struct Maquette {
     let coeur: String?               // aperçus composés d'exemple
     let trefle: String?
     let simple: String?
+    let ovaleLR: String?             // fabriqués pour les captures (EMPREINTE_FAUX)
+    let teteBeche: String?
+    let rendus: [String: NSImage]    // une empreinte seule, par style (repli)
     let dossierProjet: String
+    /// Vraies sorties du moteur (dossier EMPREINTE_REELS) : les événements
+    /// `apercu_pret` par forme (et leur variante « ajustée »), et les
+    /// `rendu_empreinte` par index et style.
+    let reels: [String: [String: Any]]        // "coeur", "coeur_ajuste", …
+    let rendusReels: [Int: [String: NSImage]]
+    let largeurRendusReels: [Int: Double]
 
     init() {
         let fm = FileManager.default
@@ -157,6 +174,11 @@ struct Maquette {
         coeur = existe((apercus as NSString).appendingPathComponent("apercu_coeur_contact.png"))
         trefle = existe((apercus as NSString).appendingPathComponent("apercu_trefle_traits.png"))
         simple = existe((apercus as NSString).appendingPathComponent("apercu_simple_contact.png"))
+        // PNG factices d'ovale coupé / tête-bêche (dossier donné par EMPREINTE_FAUX),
+        // tant que le moteur ne les produit pas lui-même.
+        let faux = ProcessInfo.processInfo.environment["EMPREINTE_FAUX"] ?? apercus
+        ovaleLR = existe((faux as NSString).appendingPathComponent("apercu_ovale_lr_contact.png"))
+        teteBeche = existe((faux as NSString).appendingPathComponent("apercu_tete_beche_contact.png"))
 
         // commandes réelles (LECTURE SEULE) : on pioche photos et vignettes
         let racine = (NSHomeDirectory() as NSString).appendingPathComponent("Documents/Empreintes MMD")
@@ -180,6 +202,53 @@ struct Maquette {
         photos = ph.isEmpty ? [Maquette.dessin("contact"), Maquette.dessin("gabor")] : ph
         mosaiques = mo.isEmpty ? photos : mo
         vignettes = vi
+
+        // --- vraies sorties du moteur
+        var ev: [String: [String: Any]] = [:]
+        var rr: [Int: [String: NSImage]] = [:]
+        var lr: [Int: Double] = [:]
+        if let dossier = ProcessInfo.processInfo.environment["EMPREINTE_REELS"],
+           let noms = try? fm.contentsOfDirectory(atPath: dossier) {
+            for n in noms.sorted() where n.hasSuffix(".json") {
+                let chemin = (dossier as NSString).appendingPathComponent(n)
+                guard let data = fm.contents(atPath: chemin),
+                      let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { continue }
+                // le png est rangé à côté du json, quel que soit le chemin écrit dedans
+                var o = obj
+                o["png"] = (dossier as NSString).appendingPathComponent(
+                    ((n as NSString).deletingPathExtension as NSString).appendingPathExtension("png") ?? n)
+                let base = (n as NSString).deletingPathExtension      // apercu_coeur_contact_ajuste
+                if base.hasPrefix("apercu_") {
+                    var cle = String(base.dropFirst("apercu_".count))  // coeur_contact_ajuste
+                    let ajuste = cle.hasSuffix("_ajuste")
+                    if ajuste { cle = String(cle.dropLast("_ajuste".count)) }
+                    if let r = cle.range(of: "_contact") { cle = String(cle[..<r.lowerBound]) }
+                    ev[ajuste ? cle + "_ajuste" : cle] = o
+                } else if base.hasPrefix("rendu_"),
+                          let i = o["index"] as? Int, let st = Moteur.cleStyle(o["style"] as? String),
+                          let png = o["png"] as? String, let img = Moteur.imageFraiche(png) {
+                    var d = rr[i] ?? [:]
+                    d[st] = img
+                    rr[i] = d
+                    if let l = o["largeur_forme"] as? Double { lr[i] = l }
+                }
+            }
+        }
+        reels = ev
+        rendusReels = rr
+        largeurRendusReels = lr
+        var r: [String: NSImage] = [:]
+        for st in ["sans", "gabor", "photo"] {
+            if let img = Moteur.imageFraiche((apercus as NSString).appendingPathComponent("apercu_simple_\(st).png")) {
+                r[st] = img
+            }
+        }
+        // le vieil échantillon « contact » montre deux doigts : une vraie
+        // vignette de commande (une seule empreinte, traits soudés) fait mieux
+        if let v = vi.first(where: { $0.contains("perrier") }) ?? vi.first, let img = Moteur.imageFraiche(v) {
+            r["contact"] = img
+        }
+        rendus = r
     }
 
     /// Image de secours dessinée (si aucune commande réelle n'est lisible).
@@ -232,8 +301,46 @@ struct Maquette {
         return m
     }
 
+    /// Les lobes « comme le moteur les enverrait » pour une forme donnée.
+    func lobesFactices(_ forme: String, nb: Int, ajusts: [Ajustement]) -> [Lobe] {
+        func l(_ i: Int, _ cx: Double, _ cy: Double, _ rx: Double, _ ry: Double, _ a: Double, _ z: [Double]) -> Lobe {
+            let aj = i < ajusts.count ? ajusts[i] : Ajustement()
+            return Lobe(index: i, cx: cx + aj.dx * rx, cy: cy + aj.dy * ry, rx: rx, ry: ry,
+                        angle: a + aj.angle, zone: z)
+        }
+        switch forme {
+        case "coeur":      // valeurs mesurées sur le vrai moteur
+            return [l(0, 0.2745, 0.4794, 0.2133, 0.4125, -20, [0.0612, 0.0669, 0.4888, 0.8930]),
+                    l(1, 0.7250, 0.4811, 0.2138, 0.4142, 20, [0.5112, 0.0669, 0.9398, 0.8963])]
+        case "ovale_lr":
+            return [l(0, 0.5, 0.5, 0.4272, 0.4398, 0, [0.0728, 0.0612, 0.4867, 0.9398]),
+                    l(1, 0.5, 0.5, 0.4272, 0.4398, 0, [0.5134, 0.0612, 0.9284, 0.9398])]
+        case "tete_beche":
+            return [l(0, 0.5, 0.5, 0.4272, 0.4398, 0, [0.0728, 0.0602, 0.9284, 0.4890]),
+                    l(1, 0.5, 0.5, 0.4272, 0.4398, 180, [0.0728, 0.5110, 0.9284, 0.9408])]
+        case "trefle":
+            // rayon de lobe 430 px sur 1797 (3) / 1857 (4) px, ovale 0,8 × rayon
+            let r = nb == 4 ? 430.0 / 1857.0 : 430.0 / 1797.0
+            let rx = r * 0.8
+            let pts: [(Double, Double, Double)] = nb == 4
+                ? [(0.5, 0.27, 0), (0.73, 0.5, 90), (0.5, 0.73, 180), (0.27, 0.5, 270)]
+                : [(0.5, 0.27, 0), (0.70, 0.62, 120), (0.30, 0.62, 240)]
+            return pts.enumerated().map { i, p in
+                l(i, p.0, p.1, rx, r, p.2, [p.0 - r, p.1 - r, p.0 + r, p.1 + r])
+            }
+        default:
+            // planche « séparées » : une médaille par empreinte, côte à côte
+            let n = max(1, nb)
+            return (0..<n).map { i in
+                let x0 = Double(i) / Double(n), x1 = Double(i + 1) / Double(n)
+                return l(i, (x0 + x1) / 2, 0.5, 0.45 / Double(n), 0.45, 0, [x0 + 0.02, 0.05, x1 - 0.02, 0.95])
+            }
+        }
+    }
+
     func commande(nb: Int, etape: EtapeCommande, forme: String? = nil, style: String = "contact",
-                  placement: Int? = nil, tailleReelle: Bool = false, exporte: Bool = false) -> Moteur {
+                  placement: Int? = nil, tailleReelle: Bool = false, exporte: Bool = false,
+                  vue: VueComposition = .chaque, detail: Int? = nil) -> Moteur {
         let m = base()
         m.ecran = .commande
         m.etape = etape
@@ -242,18 +349,50 @@ struct Maquette {
         m.style = style
         for i in 0..<nb {
             var e = EmpreinteItem(index: i, nom: Self.prenoms[i % 4])
-            if i == 1 { e.ajust = Ajustement(dx: 0.12, dy: -0.05, angle: 8) }
+            // le même ajust que la sortie moteur « _ajuste » du dossier réel
+            if i == 1 { e.ajust = Ajustement(dx: 0.12, dy: -0.05, angle: 15) }
             m.empreintes.append(e)
             m.apercusEmpreintes[i] = photos[i % photos.count]
         }
         if let forme {
             m.forme = forme
-            let chemin = forme == "coeur" ? coeur : (forme == "trefle" ? trefle : simple)
-            m.apercuCompose = chemin.flatMap(Moteur.imageFraiche)
+            // d'abord la vraie sortie du moteur (variante ajustée si l'empreinte 2 l'est)
+            let ajustee = nb == 2 && !m.empreintes[1].ajust.neutre
+            if let ev = (ajustee ? reels[forme + "_ajuste"] : nil) ?? reels[forme],
+               let png = ev["png"] as? String, let img = Moteur.imageFraiche(png) {
+                m.apercuCompose = img
+                m.lobes = Lobe.lire(ev["lobes"])
+                m.largeurForme = ev["largeur_forme"] as? Double
+                if !ajustee { for i in 0..<nb { m.empreintes[i].ajust = Ajustement() } }
+            } else {
+                let chemin: String?
+                switch forme {
+                case "coeur":      chemin = coeur
+                case "trefle":     chemin = trefle
+                case "ovale_lr":   chemin = ovaleLR ?? coeur
+                case "tete_beche": chemin = teteBeche ?? coeur
+                default:           chemin = simple
+                }
+                m.apercuCompose = chemin.flatMap(Moteur.imageFraiche)
+                m.lobes = lobesFactices(forme, nb: nb, ajusts: m.empreintes.map(\.ajust))
+                m.largeurForme = forme == "coeur" ? 0.88 : 0.85
+            }
+            m.apercuForme = forme
+            m.apercuStyle = style
+            m.ajustsApercu = Dictionary(uniqueKeysWithValues: m.empreintes.map { ($0.index, $0.ajust) })
             if etape != .composition || exporte {
                 m.cheminCompose = "\(m.dossierStockage)/\(m.idCommande)/rendus/\(forme)_\(style).svg"
             }
         }
+        for i in 0..<nb {
+            // vrais rendus seuls quand on les a, sinon les anciens échantillons
+            var parStyle = rendus
+            for (st, img) in rendusReels[i] ?? [:] { parStyle[st] = img }
+            m.rendusEmpreintes[i] = parStyle
+            m.largeurFormeEmpreinte[i] = largeurRendusReels[i] ?? 0.856
+        }
+        m.vueComposition = vue
+        m.detailEmpreinte = detail
         m.placement = placement
         m.tailleReelle = tailleReelle
         if exporte {
