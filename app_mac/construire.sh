@@ -3,8 +3,10 @@
 # double-cliquable, posé dans le dossier empreintescanner (à côté des scripts
 # Python qu'il pilote). Relance ce script après chaque modification du code.
 #
-#   ./construire.sh            compile seulement
-#   ./construire.sh --lancer   compile, ferme l'ancienne instance, puis ouvre
+#   ./construire.sh                      compile seulement
+#   ./construire.sh --lancer             compile, ferme l'ancienne instance, puis ouvre
+#   ./construire.sh --captures [dossier] compile, puis rend chaque écran en PNG
+#                                        (données factices, sans capteur ni moteur)
 set -e
 
 ICI="$(cd "$(dirname "$0")" && pwd)"
@@ -50,28 +52,9 @@ echo "→ Assemblage du bundle .app…"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN/$NOM" "$APP/Contents/MacOS/$NOM"
+# L'icône (générée par icone.sh depuis logo/logo_mmd_1024.png). Le logo
+# affiché DANS l'app est vectoriel (LogoVectoriel.swift) : rien à embarquer.
 [ -f "$ICI/Empreinte.icns" ] && cp "$ICI/Empreinte.icns" "$APP/Contents/Resources/Empreinte.icns"
-
-# --- le logo d'origine de la maison --------------------------------------
-# Emplacement canonique : app_mac/Empreinte/logo_mmd.png. On accepte aussi le
-# fichier déposé à la racine du projet, sous n'importe quel nom commençant par
-# « logo ». Sans logo, l'app retombe sur le dessin vectoriel (LogoMMD).
-LOGO=""
-for CAND in "$SRC/logo_mmd.png" "$PROJET/logo_mmd.png"; do
-    [ -f "$CAND" ] && { LOGO="$CAND"; break; }
-done
-if [ -z "$LOGO" ]; then
-    LOGO="$(find "$PROJET" "$SRC" -maxdepth 1 -type f \
-        \( -iname 'logo*.png' -o -iname 'logo*.jpg' -o -iname 'logo*.jpeg' \) \
-        2>/dev/null | sort | head -1)"
-fi
-if [ -n "$LOGO" ] && [ -f "$LOGO" ]; then
-    cp "$LOGO" "$APP/Contents/Resources/logo_mmd.png"
-    echo "   logo embarqué : $(basename "$LOGO")"
-else
-    echo "   ⚠️  pas de logo trouvé (dépose-le en $SRC/logo_mmd.png)"
-    echo "      → l'app affiche le logo vectoriel de secours."
-fi
 
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -90,6 +73,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>NSPrincipalClass</key>          <string>NSApplication</string>
     <key>LSApplicationCategoryType</key> <string>public.app-category.utilities</string>
     <key>CFBundleIconFile</key>          <string>Empreinte</string>
+    <key>NSRequiresAquaSystemAppearance</key> <true/>
 </dict>
 </plist>
 PLIST
@@ -105,11 +89,19 @@ codesign --force --deep --sign - "$APP" >/dev/null 2>&1 || true
 echo ""
 echo "✅ Terminé : $APP"
 
-if [ "$1" = "--lancer" ]; then
-    pkill -x "$NOM" 2>/dev/null || true      # ceinture et bretelles
-    sleep 0.3
-    open "$APP"
-    echo "🚀 Lancée."
-else
-    echo "   Double-clique dessus, ou lance :  open \"$APP\""
-fi
+case "$1" in
+    --lancer)
+        pkill -x "$NOM" 2>/dev/null || true      # ceinture et bretelles
+        sleep 0.3
+        open "$APP"
+        echo "🚀 Lancée."
+        ;;
+    --captures)
+        DEST="${2:-$ICI/captures}"
+        echo "→ Captures d'écran (données factices) dans $DEST…"
+        "$APP/Contents/MacOS/$NOM" --captures "$DEST"
+        ;;
+    *)
+        echo "   Double-clique dessus, ou lance :  open \"$APP\""
+        ;;
+esac

@@ -695,11 +695,13 @@ struct PanneauMiseAJour: View {
             enTete
             contenu
                 .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(18 * echelle)
+                .carte(rayon: 18, ombre: false)
             piedDePage
         }
         .padding(26 * echelle)
-        .frame(width: 470 * echelle)
-        .background(MMD.creme)
+        .frame(width: 490 * echelle)
+        .background(Papier())
         .alert("Revenir à la version précédente ?", isPresented: $confirmeRetour) {
             Button("Revenir", role: .destructive) { maj.revenirEnArriere() }
             Button("Annuler", role: .cancel) {}
@@ -711,10 +713,10 @@ struct PanneauMiseAJour: View {
 
     private var enTete: some View {
         HStack(spacing: 14 * echelle) {
-            LogoMarque(taille: 44 * echelle)
+            Logo(taille: 44, tourne: maj.occupe)
             VStack(alignment: .leading, spacing: 2 * echelle) {
                 Text("Mise à jour de l'application")
-                    .police(19, .black, .rounded).foregroundColor(MMD.noir)
+                    .police(19, .heavy).foregroundColor(MMD.encre)
                 Text("Version installée : \(maj.versionInstallee)")
                     .police(12, .medium).foregroundColor(MMD.gris)
             }
@@ -728,52 +730,52 @@ struct PanneauMiseAJour: View {
 
         case .repos, .verification:
             Chargement(texte: "Recherche d'une nouvelle version…", taille: 44)
-                .frame(maxWidth: .infinity).padding(.vertical, 24 * echelle)
+                .frame(maxWidth: .infinity).padding(.vertical, 18 * echelle)
 
         case .aJour:
-            ligne(symbole: "checkmark.circle.fill", couleur: MMD.bleu,
+            ligne(symbole: "checkmark.circle.fill", couleur: MMD.vert,
                   titre: "Tout est à jour",
                   detail: "Tu as déjà la dernière version. Rien à faire.")
 
         case .disponible:
             VStack(alignment: .leading, spacing: 12 * echelle) {
-                ligne(symbole: "arrow.down.circle.fill", couleur: MMD.rouge,
+                ligne(symbole: "sparkles", couleur: MMD.doreFonce,
                       titre: "Nouvelle version \(maj.info?.version ?? "")",
                       detail: maj.info.map { "Publiée le \($0.dateLisible)" } ?? "")
                 if let notes = maj.info?.notes, !notes.isEmpty {
-                    ScrollView {
-                        Text(notes)
-                            .police(13, .medium).foregroundColor(MMD.noir)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(14 * echelle)
-                    }
-                    .frame(maxHeight: 150 * echelle)
-                    .carteMMD()
+                    Text(notes)
+                        .police(13, .medium).foregroundColor(MMD.encre)
+                        .lineLimit(12)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(14 * echelle)
+                    .background(RoundedRectangle(cornerRadius: 14 * echelle, style: .continuous).fill(MMD.blanc))
+                    .overlay(RoundedRectangle(cornerRadius: 14 * echelle, style: .continuous)
+                        .strokeBorder(MMD.trait, lineWidth: 1.2 * echelle))
                 }
                 if travailEnCours {
                     Text("Un scan ou un rendu est en cours : termine-le d'abord, " +
                          "l'app doit se fermer pour s'installer.")
-                        .police(12, .semibold).foregroundColor(MMD.rouge)
+                        .police(12, .semibold).foregroundColor(MMD.roseFonce)
                 }
                 Text("Tes commandes et tes réglages ne sont pas touchés.")
-                    .police(11.5).foregroundColor(MMD.gris)
+                    .police(11.5, .medium).foregroundColor(MMD.gris)
             }
 
         case .telechargement:
             VStack(alignment: .leading, spacing: 10 * echelle) {
                 Text("Téléchargement… \(Int(maj.progression * 100)) %")
-                    .police(13.5, .bold, .rounded).foregroundColor(MMD.noir)
-                ProgressView(value: maj.progression)
-                    .tint(MMD.bleu)
+                    .police(13.5, .heavy).foregroundColor(MMD.encre)
+                BarreProgression(fraction: maj.progression, couleur: MMD.drageeFonce)
                 Text("Ne ferme pas l'app.")
-                    .police(11.5).foregroundColor(MMD.gris)
+                    .police(11.5, .medium).foregroundColor(MMD.gris)
             }
-            .padding(.vertical, 10 * echelle)
+            .padding(.vertical, 6 * echelle)
 
         case .installation:
             Chargement(texte: "Installation…\nL'app va se fermer et se rouvrir toute seule.",
                        taille: 44)
-                .frame(maxWidth: .infinity).padding(.vertical, 20 * echelle)
+                .frame(maxWidth: .infinity).padding(.vertical, 14 * echelle)
 
         case .erreur(let message):
             ligne(symbole: "exclamationmark.triangle.fill", couleur: MMD.rouge,
@@ -786,7 +788,7 @@ struct PanneauMiseAJour: View {
         HStack(alignment: .top, spacing: 12 * echelle) {
             Image(systemName: symbole).police(22, .regular).foregroundColor(couleur)
             VStack(alignment: .leading, spacing: 4 * echelle) {
-                Text(titre).police(15, .black, .rounded).foregroundColor(MMD.noir)
+                Text(titre).police(15, .heavy).foregroundColor(MMD.encre)
                 if !detail.isEmpty {
                     Text(detail).police(12.5, .medium).foregroundColor(MMD.gris)
                         .fixedSize(horizontal: false, vertical: true)
@@ -812,10 +814,17 @@ struct PanneauMiseAJour: View {
             }
             switch maj.etat {
             case .disponible:
-                Button("Installer") { maj.installer() }
-                    .buttonStyle(BoutonPrincipal(actif: !travailEnCours))
-                    .disabled(travailEnCours)
-                    .keyboardShortcut(.defaultAction)
+                Button {
+                    maj.installer()
+                } label: {
+                    HStack(spacing: 7 * echelle) {
+                        Image(systemName: "arrow.down.circle.fill").police(12.5, .heavy)
+                        Text("Installer")
+                    }
+                }
+                .buttonStyle(BoutonPrincipal(actif: !travailEnCours))
+                .disabled(travailEnCours)
+                .keyboardShortcut(.defaultAction)
             case .erreur:
                 Button("Réessayer") { maj.verifier() }
                     .buttonStyle(BoutonPrincipal())

@@ -14,9 +14,31 @@ enum Phase: Equatable {
 /// Écran affiché.
 enum Ecran: Equatable {
     case accueil      // grille des commandes sauvées
-    case commande     // une commande : ses empreintes + l'aperçu
+    case commande     // une commande : ses empreintes, la composition, l'envoi
     case scan         // on scanne l'empreinte d'une personne
     case cadrage      // on cadre (crop) l'empreinte scannée
+}
+
+/// Les trois étapes visibles d'une commande (navigation libre entre elles).
+enum EtapeCommande: Int, CaseIterable, Equatable {
+    case empreintes = 1
+    case composition = 2
+    case envoi = 3
+
+    var titre: String {
+        switch self {
+        case .empreintes:  return "Empreintes"
+        case .composition: return "Composition"
+        case .envoi:       return "Envoi"
+        }
+    }
+    var symbole: String {
+        switch self {
+        case .empreintes:  return "hand.point.up.left"
+        case .composition: return "heart.text.square"
+        case .envoi:       return "paperplane"
+        }
+    }
 }
 
 /// Un port série proposé par le moteur.
@@ -59,7 +81,12 @@ struct ResumeCommande: Identifiable, Equatable {
     var vignette: String?
 
     /// Date lisible en français (« 1 août 2026 »), sinon la chaîne brute.
-    var dateLisible: String {
+    var dateLisible: String { Self.lisible(date, format: "d MMM yyyy") }
+
+    /// « 1 août 2026 à 14:30 ».
+    var dateComplete: String { Self.lisible(date, format: "d MMMM yyyy 'à' HH:mm") }
+
+    static func lisible(_ date: String, format: String) -> String {
         let entree = ISO8601DateFormatter()
         entree.formatOptions = [.withInternetDateTime]
         var d = entree.date(from: date)
@@ -72,16 +99,40 @@ struct ResumeCommande: Identifiable, Equatable {
         guard let d else { return date }
         let sortie = DateFormatter()
         sortie.locale = Locale(identifier: "fr_FR")
-        sortie.dateFormat = "d MMM yyyy"
+        sortie.dateFormat = format
         return sortie.string(from: d)
     }
 }
 
-/// Résultat d'un export (zip prêt à envoyer).
+/// Résultat d'un export (dossier lisible + zip prêt à envoyer).
 struct Export: Equatable {
-    var dossier: String
-    var zip: String
-    var resume: String
+    var dossier: String                 // Exports/<Nom client>/
+    var zip: String                     // Exports/<Nom client>.zip
+    var resume: String                  // texte du mail
+    var nomExport: String = ""          // « Dupont »
+    var fichiers: [String] = []         // chemins absolus produits
+    var forme: String? = nil
+    var style: String? = nil
+    var styleDefaut = false             // aucun style choisi : « Traits soudés » d'office
+    var avertissements: [String] = []
+    var horodatage = Date()             // distingue deux exports identiques
+
+    /// Chemins relatifs au dossier d'export, triés (pour dessiner l'arbre).
+    var relatifs: [String] {
+        let base = (dossier as NSString).standardizingPath + "/"
+        return fichiers.compactMap { f -> String? in
+            let s = (f as NSString).standardizingPath
+            return s.hasPrefix(base) ? String(s.dropFirst(base.count)) : (f as NSString).lastPathComponent
+        }.sorted()
+    }
+}
+
+/// Avancement d'un export (événement optionnel `export_progres`).
+struct ProgresExport: Equatable {
+    var etape: Int
+    var total: Int
+    var texte: String
+    var fraction: Double { total > 0 ? Double(max(0, etape - 1)) / Double(total) : 0 }
 }
 
 /// Contrôleur : lance `moteur_live.py`, lui envoie des commandes et publie
@@ -93,6 +144,7 @@ final class Moteur: ObservableObject {
     @Published var statut: String = "Démarrage…"
     @Published var poses: Int = 0
     @Published var apercu: NSImage? = nil          // mosaïque en cours de scan
+    @Published var historiquePoses: [NSImage] = [] // la mosaïque après chaque pose
     @Published var ports: [Port] = []
     @Published var portActif: String? = nil
     @Published var connecte = false
@@ -102,6 +154,7 @@ final class Moteur: ObservableObject {
 
     // navigation
     @Published var ecran: Ecran = .accueil
+    @Published var etape: EtapeCommande = .empreintes
 
     // bibliothèque de commandes
     @Published var commandes: [ResumeCommande] = []
@@ -122,9 +175,12 @@ final class Moteur: ObservableObject {
     @Published var apercuEnCours = false
     @Published var composeEnCours = false
     @Published var cheminCompose: String? = nil
+    @Published var placement: Int? = nil           // empreinte en cours de placement
+    @Published var tailleReelle = false            // médaille à l'échelle 1 affichée
 
     // export
     @Published var exportEnCours = false
+    @Published var exportProgres: ProgresExport? = nil
     @Published var dernierExport: Export? = nil
 
     // cadrage
@@ -143,24 +199,26 @@ final class Moteur: ObservableObject {
     private var tacheAjust: Task<Void, Never>?
     private var tacheErreur: Task<Void, Never>?
 
+    static let nbMax = 4
+
     var occupe: Bool { phase == .compteRebours || phase == .scan || phase == .travail }
 
     /// Formes proposées selon le nombre d'empreintes (clé moteur, libellé).
     var formesDisponibles: [(String, String)] {
         switch empreintes.count {
-        case 2:  return [("simple", "Simple"), ("coeur", "Cœur")]
-        case 3:  return [("simple", "Simple"), ("trefle", "Trèfle 3")]
-        case 4:  return [("simple", "Simple"), ("trefle", "Trèfle 4")]
+        case 2:  return [("coeur", "Cœur"), ("simple", "Côte à côte")]
+        case 3:  return [("trefle", "Trèfle 3"), ("simple", "Côte à côte")]
+        case 4:  return [("trefle", "Trèfle 4"), ("simple", "Côte à côte")]
         default: return [("simple", "Simple")]
         }
     }
 
     /// Les styles de tracé, avec libellé et explication.
-    static let styles: [(cle: String, nom: String, aide: String)] = [
-        ("gabor",   "Gabor",         "Crêtes épaisses et séparées (vallées visibles)."),
-        ("sans",    "Traits",        "Traits fins, aucun trait ne touche son voisin."),
+    nonisolated static let styles: [(cle: String, nom: String, aide: String)] = [
         ("contact", "Traits soudés", "Traits fins, les bifurcations se rejoignent."),
-        ("photo",   "Photo",         "La vraie photo de l'empreinte découpée."),
+        ("sans",    "Traits",        "Traits fins, aucun trait ne touche son voisin."),
+        ("gabor",   "Gabor",         "Crêtes épaisses et séparées (vallées visibles)."),
+        ("photo",   "Photo",         "La vraie photo de l'empreinte, découpée."),
     ]
 
     /// Le placement fin n'a de sens que sur les formes à plusieurs lobes.
@@ -168,6 +226,9 @@ final class Moteur: ObservableObject {
         guard let forme else { return false }
         return (forme == "coeur" || forme == "trefle") && empreintes.count > 1
     }
+
+    /// Un rendu a-t-il été enregistré pour la commande courante ?
+    var renduEnregistre: Bool { cheminCompose != nil }
 
     // MARK: - cycle de vie
 
@@ -237,6 +298,11 @@ final class Moteur: ObservableObject {
 
     func rafraichirPorts() { envoyer("PORTS") }
 
+    /// Libellé court de l'état du capteur.
+    var etatCapteur: String {
+        capteurPret ? "Capteur prêt" : (connecte ? "Connecté" : "Pas de capteur")
+    }
+
     func nouveauScan() {
         guard connecte, !occupe else { return }
         erreur = nil
@@ -274,6 +340,7 @@ final class Moteur: ObservableObject {
     // MARK: - bibliothèque de commandes
 
     func chargerCommandes() {
+        guard versMoteur != nil else { return }     // moteur absent : rien à lire
         chargementListe = true
         envoyer("COMMANDES")
     }
@@ -281,6 +348,7 @@ final class Moteur: ObservableObject {
     func demanderDossier() { envoyer("DOSSIER") }
 
     func changerDossier(_ chemin: String) {
+        guard versMoteur != nil else { return }
         chargementListe = true
         envoyer("DOSSIER \(chemin)")
     }
@@ -289,6 +357,7 @@ final class Moteur: ObservableObject {
         reinitialiserCommande()
         envoyer("COMMANDE \(nom)")
         nomCommande = nom
+        etape = .empreintes
         ecran = .commande
     }
 
@@ -302,6 +371,7 @@ final class Moteur: ObservableObject {
             if let v = r.vignette { apercuCompose = Self.imageFraiche(v) }
         }
         envoyer("OUVRIR \(id)")
+        etape = .empreintes
         ecran = .commande
     }
 
@@ -330,10 +400,29 @@ final class Moteur: ObservableObject {
         apercuCompose = nil
         cheminCompose = nil
         dernierExport = nil
+        exportProgres = nil
         forme = nil
+        placement = nil
         apercuEnCours = false
         composeEnCours = false
         recadrage = false          // OUVRIR / COMMANDE remettent le moteur à zéro
+    }
+
+    // MARK: - étapes de la commande
+
+    /// Change d'étape. En arrivant sur la composition sans forme valable, on
+    /// en choisit une d'office (la première proposée) pour que l'aperçu
+    /// apparaisse sans rien demander.
+    func allerEtape(_ e: EtapeCommande) {
+        etape = e
+        if e == .composition, !empreintes.isEmpty {
+            let valables = formesDisponibles.map(\.0)
+            if let f = forme, valables.contains(f) {
+                if apercuCompose == nil && !apercuEnCours { demanderApercu() }
+            } else if let premiere = valables.first {
+                choisirForme(premiere)
+            }
+        }
     }
 
     // MARK: - empreintes
@@ -341,12 +430,22 @@ final class Moteur: ObservableObject {
     func ajouterEmpreinte(_ nom: String) {
         personneEnCours = Self.nettoyer(nom)
         apercu = nil
+        historiquePoses = []
         poses = 0
         phase = .attente
         erreur = nil
         recadrage = false
         envoyer("EMPREINTE \(personneEnCours)")
         ecran = .scan
+    }
+
+    /// Refait l'empreinte i : l'ancienne est retirée, puis on rescanne la
+    /// même personne (la nouvelle empreinte arrive en fin de liste).
+    func refaireEmpreinte(_ index: Int) {
+        guard index < empreintes.count else { return }
+        let nom = empreintes[index].nom
+        supprimerEmpreinte(index)
+        ajouterEmpreinte(nom)
     }
 
     func renommerEmpreinte(_ index: Int, _ nom: String) {
@@ -454,14 +553,18 @@ final class Moteur: ObservableObject {
         envoyer("ENREGISTRER \(forme) \(style)")
     }
 
+    // MARK: - export et envoi
+
     func exporter() {
         guard !exportEnCours else { return }
         exportEnCours = true
+        exportProgres = nil
         statut = "Préparation du dossier à envoyer…"
         envoyer("EXPORTER")
     }
 
-    /// Ouvre le compositeur de mail avec le zip en pièce jointe.
+    /// Ouvre le compositeur de mail avec le zip en pièce jointe et le
+    /// récapitulatif en corps de message : maman envoie elle-même.
     func envoyerParMail() {
         guard let e = dernierExport else { return }
         guard let service = NSSharingService(named: .composeEmail) else {
@@ -472,13 +575,25 @@ final class Moteur: ObservableObject {
         service.perform(withItems: [e.resume, URL(fileURLWithPath: e.zip)])
     }
 
+    func montrerDansFinder(_ chemin: String) {
+        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: chemin)])
+    }
+
+    func copierRecapitulatif() {
+        guard let e = dernierExport else { return }
+        let presse = NSPasteboard.general
+        presse.clearContents()
+        presse.setString(e.resume, forType: .string)
+        statut = "Récapitulatif copié — colle-le où tu veux."
+    }
+
     private func envoyer(_ commande: String) {
         guard let versMoteur else { return }
         versMoteur.write(Data((commande + "\n").utf8))
     }
 
     /// Affiche une erreur qui s'efface toute seule (jamais bloquante).
-    private func signaler(_ texte: String) {
+    func signaler(_ texte: String) {
         erreur = texte
         tacheErreur?.cancel()
         tacheErreur = Task { @MainActor in
@@ -545,9 +660,12 @@ final class Moteur: ObservableObject {
 
         case "scan_ok":
             poses = obj["poses"] as? Int ?? poses
-            if let chemin = obj["apercu"] as? String { apercu = Self.imageFraiche(chemin) }
+            if let chemin = obj["apercu"] as? String, let img = Self.imageFraiche(chemin) {
+                apercu = img
+                historiquePoses.append(img)
+            }
             phase = .attente
-            statut = "Raccordée ! \(poses) pose\(poses > 1 ? "s" : "") — " +
+            statut = "Raccordée ! \(Libelle.pluriel(poses, "pose")) — " +
                      "décale un peu le doigt puis repose-le."
 
         case "scan_rejete":
@@ -561,6 +679,7 @@ final class Moteur: ObservableObject {
         case "reset":
             poses = 0
             apercu = nil
+            historiquePoses = []
             phase = .attente
             statut = "On repart de zéro — pose ton doigt sur le capteur."
 
@@ -594,6 +713,7 @@ final class Moteur: ObservableObject {
             personneEnCours = obj["personne"] as? String ?? personneEnCours
             poses = 0
             apercu = nil
+            historiquePoses = []
             cropInitial = nil
             completerInitial = true
             recadrage = false
@@ -626,18 +746,26 @@ final class Moteur: ObservableObject {
                     apercusEmpreintes[i] = Self.imageFraiche(p)
                 }
             }
-            apercu = nil
-            poses = 0
             recadrage = false
             phase = .attente
-            // On revient à la liste des empreintes : PAS de composite automatique.
+            // On revient à la liste des empreintes : PAS de composite
+            // automatique (la forme sera rechoisie à l'étape composition).
             apercuCompose = nil
             cheminCompose = nil
             forme = nil
-            ecran = .commande
+            placement = nil
+            // « Refaire » enchaîne SUPPRIMER puis EMPREINTE : la validation de
+            // la suppression arrive alors que le scan a déjà commencé — on ne
+            // quitte pas l'écran de scan dans ce cas.
+            if ecran != .scan {
+                apercu = nil
+                poses = 0
+                historiquePoses = []
+                ecran = .commande
+                etape = .empreintes
+            }
             rafraichirMiniatures()
-            let n = empreintes.count
-            statut = "\(n) empreinte\(n > 1 ? "s" : "") dans la commande."
+            statut = "\(Libelle.pluriel(empreintes.count, "empreinte")) dans la commande."
 
         case "empreinte_apercu":
             if let i = obj["index"] as? Int, let png = obj["png"] as? String,
@@ -663,12 +791,27 @@ final class Moteur: ObservableObject {
             cheminCompose = obj["svg"] as? String
             statut = "Rendu enregistré dans le dossier de la commande."
 
+        case "export_progres":
+            if let etape = obj["etape"] as? Int, let total = obj["total"] as? Int {
+                let texte = obj["texte"] as? String ?? ""
+                exportProgres = ProgresExport(etape: etape, total: total, texte: texte)
+                if !texte.isEmpty { statut = texte }
+            }
+
         case "exporte":
             exportEnCours = false
+            exportProgres = nil
             if let dossier = obj["dossier"] as? String, let zip = obj["zip"] as? String {
-                let resume = obj["resume"] as? String ?? nomCommande
-                dernierExport = Export(dossier: dossier, zip: zip, resume: resume)
-                NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: zip)])
+                var e = Export(dossier: dossier, zip: zip,
+                               resume: obj["resume"] as? String ?? nomCommande)
+                e.nomExport = obj["nom_export"] as? String
+                    ?? (dossier as NSString).lastPathComponent
+                e.fichiers = obj["fichiers"] as? [String] ?? []
+                e.forme = Self.cleForme(obj["forme"] as? String)
+                e.style = Self.cleStyle(obj["style"] as? String)
+                e.styleDefaut = (obj["style_defaut"] as? Bool) ?? false
+                e.avertissements = obj["avertissements"] as? [String] ?? []
+                dernierExport = e
                 statut = "Dossier prêt : \((zip as NSString).lastPathComponent)"
             }
 
@@ -676,11 +819,16 @@ final class Moteur: ObservableObject {
             let raison = obj["raison"] as? String ?? "erreur inconnue"
             composeEnCours = false
             exportEnCours = false
+            exportProgres = nil
             apercuEnCours = false
             chargementListe = false
             // Les commandes que l'ancien moteur ne connaît pas ne doivent pas
             // affoler l'utilisateur : on n'affiche que les vraies erreurs.
-            if !raison.lowercased().hasPrefix("commande inconnue") {
+            // « Export incomplet : … » double les `avertissements` de
+            // l'événement `exporte`, déjà montrés dans la feuille d'envoi.
+            let doublonExport = raison.hasPrefix("Export incomplet")
+                && !(dernierExport?.avertissements.isEmpty ?? true)
+            if !raison.lowercased().hasPrefix("commande inconnue") && !doublonExport {
                 signaler(raison)
             }
             if (obj["fatal"] as? Bool) == true { statut = "Dépendances manquantes" }
@@ -806,8 +954,8 @@ final class Moteur: ObservableObject {
     // MARK: - localisation du script Python
 
     /// Renvoie (interpréteur python, chemin de moteur_live.py, dossier de travail).
-    /// Ordre : dans l'app → Application Support → dossier de développement.
-    private static func localiserScript() -> (String, String?, String) {
+    /// Ordre : dans l'app → à côté → dossier de développement → Application Support.
+    static func localiserScript() -> (String, String?, String) {
         let fm = FileManager.default
         var dossiers: [String] = []
         // 1) embarqué dans l'app (distribution par clé USB)
