@@ -35,13 +35,13 @@ Commandes reconnues (une par ligne) :
     SUPPRIMER_COMMANDE <id>     -> vers <dossier>/.corbeille/
     AJUSTER <i> <dx> <dy> <angle> -> retouche le placement dans le lobe
     EMPREINTE_APERCU <i>  -> PNG de la photo normalisée de l'empreinte i
-    EXPORTER              -> zip de la commande + résumé pour un mail
+    EXPORTER              -> dossier + zip au nom du client, résumé du mail
 
 Événements renvoyés (JSON, champ "event") :
     ready, ports, connected, status, bouton, touche, scan_ok, scan_rejete,
     scan_fail, reset, final, commande, commandes, dossier, empreinte_debut,
     empreinte_validee, recadrer, ajuste, empreinte_apercu, apercu_pret,
-    compose, exporte, error, bye
+    compose, export_progres, exporte, error, bye
 
 Tout est rangé sur le disque par magasin_commandes.py — voir PROTOCOLE_V2.md.
 """
@@ -585,16 +585,37 @@ def apercu_empreinte(index):
 
 
 def exporter_commande():
-    """EXPORTER : zip du dossier + petit texte à coller dans un mail."""
+    """EXPORTER : dossier lisible au nom du client (photo + tracé de chaque
+    empreinte dans le style choisi, rendu final, récapitulatif) dans
+    <dossier_commandes>/Exports/, le même en zip, et le texte du mail."""
     if not _assurer_dossier():
         return
+    # l'aperçu composé déjà calculé pour la forme/le style de la commande
+    # est à jour (le cache est vidé à chaque retouche) : inutile de le refaire
+    deja = apercus.get(f"{commande.get('forme')}|{commande.get('style')}")
+
+    def progres(etape, total, texte):
+        envoyer(event="export_progres", etape=etape, total=total, texte=texte)
+
+    envoyer(event="status", texte="Préparation de l'export…")
+    led("TRAVAIL")
     try:
-        chemin_zip, texte = mag.exporter(commande)
+        res = mag.exporter(commande, rendu_compose=deja, progres=progres)
     except Exception as erreur:
+        led("ERREUR")
         envoyer(event="error", raison=f"Export : {erreur}")
         return
-    envoyer(event="exporte", dossier=commande["dossier"], zip=chemin_zip,
-            resume=texte, nom=commande["nom"], id=commande["id"])
+    led("OK")
+    envoyer(event="exporte", dossier=res["dossier"], zip=res["zip"],
+            resume=res["resume"], nom=commande["nom"], id=commande["id"],
+            nom_export=res["nom"], fichiers=res["fichiers"],
+            forme=res["forme"], style=res["style"],
+            style_defaut=res["style_defaut"],
+            avertissements=res["avertissements"],
+            dossier_commande=commande["dossier"])
+    if res["avertissements"]:                 # l'app actuelle les affiche ainsi
+        envoyer(event="error", raison="Export incomplet : "
+                + " ".join(res["avertissements"]))
 
 
 def nouvelle_empreinte(nom):
@@ -642,16 +663,34 @@ def valider_empreinte(argument=""):
     if mosaique is None:
         envoyer(event="scan_fail", raison="Aucune pose pour cette empreinte.")
         return
+    poses = poses_session(session)            # avant de jeter la session
     session = fus.SessionFusion()
-    ajouter_empreinte(personne, mosaique, crop, completer)
+    ajouter_empreinte(personne, mosaique, crop, completer, poses)
 
 
-def ajouter_empreinte(nom, mosaique, crop=None, completer=True):
-    """Range une empreinte terminée dans la commande, et sur le disque."""
-    commande["empreintes"].append({
+def poses_session(sess):
+    """Captures brutes acceptées par la session (SessionFusion.captures), à
+    garder pour re-fusionner plus tard avec de meilleurs algorithmes. Une
+    SessionFusion qui ne les retient pas encore donne simplement []."""
+    captures = getattr(sess, "captures", [])
+    if captures is None:
+        return []
+    try:
+        return [c for c in list(captures) if c is not None]
+    except TypeError:
+        return []
+
+
+def ajouter_empreinte(nom, mosaique, crop=None, completer=True, poses=None):
+    """Range une empreinte terminée dans la commande, et sur le disque
+    (poses brutes comprises : <empreinte>/poses/pose_01.png…)."""
+    empreinte = {
         "nom": nom or f"Empreinte {len(commande['empreintes']) + 1}",
         "mosaique": mosaique, "crop": crop, "completer": completer,
-        "ajust": dict(mag.AJUST_NEUTRE)})
+        "ajust": dict(mag.AJUST_NEUTRE)}
+    if poses:                       # écrites puis libérées par mag.synchroniser
+        empreinte["poses"] = list(poses)
+    commande["empreintes"].append(empreinte)
     _vider_apercus()
     if _assurer_dossier():
         _persister()
