@@ -47,6 +47,10 @@
   <button id="bouton">Écouter</button>
   <div id="niveau"><div></div></div>
   <div id="etat"></div>
+  <div style="font-size:12px;color:#5a626c;text-align:center;max-width:240px">
+    iPhone : coupe le petit interrupteur « silencieux » sur le côté et monte
+    le volume, sinon le son reste muet.
+  </div>
 
 <script>
 const bouton = document.getElementById("bouton");
@@ -75,8 +79,20 @@ function demarrer() {
   bouton.disabled = true;
   dire("Connexion…");
 
-  audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  const AC = window.AudioContext || window.webkitAudioContext;
+  // Tourner directement à 16 kHz = aucun ré-échantillonnage bloc par bloc
+  // (c'était la source des petits clics réguliers). Repli si non supporté.
+  try { audioCtx = new AC({ sampleRate: 16000 }); }
+  catch (e) { audioCtx = new AC(); }
   prochainDepart = 0;
+  // iOS : l'audio démarre « suspendu » et doit être débloqué DANS le geste
+  // du clic — on le réveille et on joue un son muet d'amorçage.
+  audioCtx.resume();
+  try {
+    const vide = audioCtx.createBuffer(1, 1, 22050);
+    const s0 = audioCtx.createBufferSource();
+    s0.buffer = vide; s0.connect(audioCtx.destination); s0.start(0);
+  } catch (e) {}
 
   const proto = location.protocol === "https:" ? "wss" : "ws";
   ws = new WebSocket(proto + "://" + location.host + "/ecouter");
@@ -101,6 +117,7 @@ function demarrer() {
       return;
     }
     if (!actif || !audioCtx) return;
+    if (audioCtx.state === "suspended") audioCtx.resume();  // iOS se rendort
     jouer(ev.data);
   };
 
@@ -126,8 +143,11 @@ function jouer(arrayBuffer) {
   src.connect(audioCtx.destination);
 
   const maintenant = audioCtx.currentTime;
-  // petit coussin de 150 ms : absorbe les à-coups du réseau sans trop retarder
-  if (prochainDepart < maintenant + 0.05) prochainDepart = maintenant + 0.15;
+  // coussin de 250 ms : absorbe les à-coups du réseau. On ne « resynchronise »
+  // (petit silence) que si le flux a vraiment pris du retard, pas à chaque fois.
+  if (prochainDepart < maintenant + 0.08) prochainDepart = maintenant + 0.25;
+  // si le retard s'accumule (dérive d'horloge), on se recale en douceur
+  if (prochainDepart > maintenant + 0.6) prochainDepart = maintenant + 0.3;
   src.start(prochainDepart);
   prochainDepart += buf.duration;
 
