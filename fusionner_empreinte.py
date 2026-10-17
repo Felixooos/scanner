@@ -19,10 +19,23 @@ Principe :
   5. rendu final aux filtres de Gabor.
 
 Une nouvelle pose COMPLÈTE la mosaïque, elle ne la repeint pas (§ carte_qualite
-et SessionFusion._deposer) : là où il n'y a rien encore, elle remplit ; là où il
-y a déjà des crêtes, c'est la meilleure des deux qui l'emporte, mesurée par une
-carte de netteté locale. Un bord de pose flou (contact partiel du doigt) ne peut
-donc plus écraser une zone déjà nette.
+et SessionFusion._recomposer) : là où il n'y a rien encore, elle remplit ; là où
+il y a déjà des crêtes, c'est la meilleure des deux qui l'emporte, mesurée par
+une carte de netteté locale. Un bord de pose flou (contact partiel du doigt) ne
+peut donc plus écraser une zone déjà nette.
+
+Fusion par CONSENSUS (anti-taches) : chaque pose est gardée en couche alignée
+(bloc warpé + poids + netteté + plausibilité). Là où plusieurs poses se
+recouvrent, on mesure leur DÉSACCORD local (résidu entre une pose et l'estimation
+des autres, lissé sur ~1 période de crête) ; en cas de désaccord, c'est la pose
+la plus PLAUSIBLE qui l'emporte — celle dont le voisinage ressemble le plus à
+des crêtes propres (§ carte_plausibilite : corrélation locale avec une sinusoïde
+orientée à la période des crêtes). Une tache (blob sombre qui ponte deux crêtes,
+point clair rond, traînée) n'apparaît que dans une pose : elle est en désaccord
+avec les autres et peu plausible, donc rejetée. Avec 3 poses ou plus s'ajoute un
+vote robuste (moindres carrés repondérés) : la pose qui s'écarte des autres perd
+sa voix. Là où les poses sont d'accord, rien ne change : les détails vrais
+(pores, cicatrices, minuties) restent, même s'ils ressemblent peu à des crêtes.
 """
 
 import datetime
@@ -54,9 +67,31 @@ FONDU_BORD = 30.0          # px de montée en puissance après l'érosion
 PLANCHER_QUALITE = 0.25    # une pose pâle pèse moins, mais couvre quand même
 SEUIL_CONFIANCE = 0.8      # poids déjà accumulé à partir duquel on fait
                            # pleinement confiance à la mosaïque
-PENTE_ARBITRAGE = 6.0      # netteté de la bascule ancien <-> nouveau
-BIAIS_ARBITRAGE = 0.25     # à qualité égale, l'existant garde la priorité
-PLANCHER_ARBITRAGE = 0.05  # un nouveau franchement moins bon garde 5 % de voix
+PENTE_ARBITRAGE = 6.0      # netteté de la bascule entre poses de netteté différente
+BIAIS_ARBITRAGE = 0.25     # marge : la meilleure pose garde la priorité
+PLANCHER_ARBITRAGE = 0.05  # une pose franchement moins nette garde 5 % de voix
+
+# --- réglages du consensus entre poses (anti-taches) ---------------------
+NB_ORIENTATIONS = 16       # banc de Gabor pour la plausibilité (11,25° de pas)
+SIGMA_PLAUSIBILITE = 0.4   # fenêtre de mesure de la plausibilité (en périodes)
+SIGMA_ORIENTATION = 2.5    # lissage du tenseur de structure (en périodes)
+EROSION_PLAUSIBILITE = 0.8 # la plausibilité prend le MIN sur ce diamètre (en
+                           # périodes) : le pourtour d'une tache est suspect aussi
+DESACCORD_BAS = 0.25       # résidu normalisé : en dessous, les poses sont d'accord
+DESACCORD_HAUT = 0.65      # ... au-dessus, le désaccord est franc
+PENTE_PLAUSIBILITE = 14.0  # netteté de la bascule vers la pose la plus plausible
+BIAIS_PLAUSIBILITE = 0.08  # marge de plausibilité gardée par la meilleure pose
+PLAUSIBILITE_MINI = 0.2    # en dessous (aucune pose n'a de crêtes ici), la
+                           # netteté ne départage plus : simple moyenne
+SIGMA_ROBUSTE = 0.25       # plancher de l'échelle du vote robuste (≥ 3 poses) :
+                           # l'échelle réelle est le résidu moyen des poses
+                           # présentes, une pose qui s'écarte ~2x plus que
+                           # les autres perd sa voix
+ITERATIONS_CONSENSUS = 2   # passes de repondération (IRLS), à 3 poses ou plus
+AMPLITUDE_REFERENCE = 40.0 # amplitude (RMS) de crêtes franches sur l'image
+                           # améliorée, et plancher de normalisation : une zone
+AMPLITUDE_PLANCHER = 20.0  # pâle (tache sombre, pression faible) voit son bruit
+                           # atténué au lieu d'être gonflé en « désaccord »
 
 
 def masque_doigt(image):
@@ -92,7 +127,11 @@ def periode_cretes(image):
         return PERIODE_DEFAUT
     y0, x0 = (h - n) // 2, (w - n) // 2
     p = image[y0:y0 + n, x0:x0 + n].astype(np.float32)
-    p = (p - p.mean()) * np.outer(np.hanning(n), np.hanning(n)).astype(np.float32)
+    # passe-haut : le contour du doigt et l'éclairage (basses fréquences)
+    # pèsent sinon plus lourd que les crêtes dans le spectre, et la période
+    # mesurée saute à 30-40 px sur une pose au contact partiel
+    p = p - cv2.GaussianBlur(p, (0, 0), 12.0)
+    p = p * np.outer(np.hanning(n), np.hanning(n)).astype(np.float32)
     spectre = np.abs(np.fft.fftshift(np.fft.fft2(p))) ** 2
     centre = n // 2
     lignes, colonnes = np.mgrid[0:n, 0:n]
@@ -100,14 +139,40 @@ def periode_cretes(image):
     somme = np.bincount(rayon, spectre.ravel(), minlength=centre + 1)
     compte = np.maximum(np.bincount(rayon, minlength=centre + 1), 1)
     profil = (somme / compte)[:centre]
-    bas, haut = max(int(n / 40), 2), max(int(n / 6), 4)   # périodes 6 à 40 px
+    # blanchiment : le spectre d'une image naturelle décroît en ~1/f², on
+    # redresse pour que le pic des crêtes ressorte seul
+    profil = profil * (np.arange(centre, dtype=np.float64) ** 2)
+    bas, haut = max(int(n / 40), 2), max(int(n / 5), 4)   # périodes 5 à 40 px
     if haut <= bas + 1:
         return PERIODE_DEFAUT
     k = bas + int(np.argmax(profil[bas:haut]))
-    return float(np.clip(n / max(k, 1), 6.0, 40.0))
+    return float(np.clip(n / max(k, 1), 5.0, 40.0))
 
 
-def carte_qualite(brute, taille=None):
+def _etirer(brute):
+    """Même étirement global (percentiles 2-98) que ameliorer(), en float :
+    les poses se mesurent ainsi sur la même échelle."""
+    bas, haut = (float(v) for v in np.percentile(brute, (2, 98)))
+    if haut <= bas:
+        haut = bas + 1.0
+    return np.clip((brute.astype(np.float32) - bas) * 255.0 / (haut - bas),
+                   0, 255).astype(np.float32)
+
+
+def _passe_bande(f, periode):
+    """Bande de fréquence des crêtes (différence de gaussiennes)."""
+    return (cv2.GaussianBlur(f, (0, 0), periode / 6.0)
+            - cv2.GaussianBlur(f, (0, 0), periode / 2.0))
+
+
+def _ajuster_taille(carte, taille):
+    if taille is not None and carte.shape != tuple(taille):
+        carte = cv2.resize(carte, (int(taille[1]), int(taille[0])),
+                           interpolation=cv2.INTER_LINEAR)
+    return carte.astype(np.float32)
+
+
+def carte_qualite(brute, taille=None, periode=None):
     """Netteté locale des crêtes, de 0 (rien d'exploitable) à 1 (crêtes
     franches), calculée sur la capture BRUTE.
 
@@ -116,23 +181,114 @@ def carte_qualite(brute, taille=None):
     doigt mal posé garde peu d'énergie dans la bande de fréquence des crêtes,
     et son score s'effondre — c'est ce qui empêche ce bord d'écraser une zone
     déjà bien scannée."""
-    bas, haut = np.percentile(brute, (2, 98))         # même étirement global
-    if haut <= bas:                                   # que ameliorer(), pour
-        haut = bas + 1.0                              # comparer des poses
-    f = np.clip((brute.astype(np.float32) - bas) * 255.0 / (haut - bas), 0, 255)
-
-    periode = periode_cretes(brute)
-    bande = (cv2.GaussianBlur(f, (0, 0), periode / 6.0)
-             - cv2.GaussianBlur(f, (0, 0), periode / 2.0))
+    f = _etirer(brute)
+    if periode is None:
+        periode = periode_cretes(brute)
+    bande = _passe_bande(f, periode)
     energie = np.sqrt(np.maximum(
         cv2.GaussianBlur(bande * bande, (0, 0), periode), 0.0))
 
     qualite = np.clip((energie - QUALITE_BASSE)
                       / (QUALITE_HAUTE - QUALITE_BASSE), 0.0, 1.0)
-    if taille is not None and qualite.shape != tuple(taille):
-        qualite = cv2.resize(qualite, (int(taille[1]), int(taille[0])),
-                             interpolation=cv2.INTER_LINEAR)
-    return qualite.astype(np.float32)
+    return _ajuster_taille(qualite, taille)
+
+
+_NOYAUX_GABOR = {}
+
+
+def _noyaux_gabor(periode):
+    """Banc de filtres de Gabor (cosinus) à la période donnée, un par
+    orientation, normalisés pour répondre 1 à une sinusoïde d'amplitude 1 de
+    même période et même orientation. Mis en cache (période arrondie)."""
+    cle = round(float(periode), 1)
+    if cle in _NOYAUX_GABOR:
+        return _NOYAUX_GABOR[cle]
+    sigma = 0.55 * cle                      # ~1 période de large à mi-hauteur
+    taille = 2 * int(np.ceil(2.5 * sigma)) + 1
+    demi = taille // 2
+    yy, xx = np.mgrid[-demi:demi + 1, -demi:demi + 1].astype(np.float32)
+    noyaux = []
+    for k in range(NB_ORIENTATIONS):
+        theta = np.pi * k / NB_ORIENTATIONS   # direction NORMALE aux crêtes
+        u = xx * np.cos(theta) + yy * np.sin(theta)
+        v = -xx * np.sin(theta) + yy * np.cos(theta)
+        # un peu plus long le long des crêtes (gamma < 1) : suit la crête
+        g = np.exp(-(u * u + (0.7 * v) ** 2) / (2 * sigma * sigma))
+        noyau = g * np.cos(2 * np.pi * u / cle)
+        noyau -= noyau.mean() * g / g.mean()  # moyenne nulle (ignore l'éclairage)
+        gain = float((noyau * np.cos(2 * np.pi * u / cle)).sum())
+        noyaux.append((noyau / max(gain, 1e-6)).astype(np.float32))
+    _NOYAUX_GABOR[cle] = noyaux
+    return noyaux
+
+
+def orientation_cretes(bande, periode):
+    """Direction locale du gradient dominant (normale aux crêtes), en
+    radians dans [0, pi), par tenseur de structure lissé sur ~2,5 périodes.
+
+    Les gradients sont NORMALISÉS avant le tenseur : chaque pixel vote avec
+    la même voix quel que soit son contraste. Sans cela, une traînée claire
+    bien contrastée impose sa propre direction à tout son voisinage, et la
+    plausibilité la prend alors pour une crête parfaitement régulière."""
+    gx = cv2.Sobel(bande, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(bande, cv2.CV_32F, 0, 1, ksize=3)
+    norme = np.sqrt(gx * gx + gy * gy) + 0.5 * QUALITE_BASSE
+    gx, gy = gx / norme, gy / norme
+    s = SIGMA_ORIENTATION * periode
+    jxx = cv2.GaussianBlur(gx * gx, (0, 0), s)
+    jyy = cv2.GaussianBlur(gy * gy, (0, 0), s)
+    jxy = cv2.GaussianBlur(gx * gy, (0, 0), s)
+    theta = 0.5 * np.arctan2(2.0 * jxy, jxx - jyy)      # ]-pi/2, pi/2]
+    return np.mod(theta, np.pi).astype(np.float32)
+
+
+def carte_plausibilite(brute, taille=None, periode=None):
+    """À quel point chaque voisinage ressemble à des crêtes PROPRES, de 0 à 1.
+
+    On ajuste localement une sinusoïde orientée (filtre de Gabor à la période
+    et dans la direction mesurées) et on garde le carré de la corrélation
+    locale entre l'image et cet ajustement, sur une fenêtre de ~1 période.
+    Des crêtes régulières donnent ~1. Une tache qui ne suit pas les crêtes —
+    blob sombre pontant deux crêtes, point clair rond, traînée — n'est pas
+    expliquée par la sinusoïde : le score chute. Un point clair qui efface
+    les crêtes n'a aucune énergie à expliquer : score ~0.
+
+    Mesurée sur la brute (même échelle pour toutes les poses, et quatre fois
+    moins de pixels que l'image améliorée). Sert UNIQUEMENT à départager des
+    poses en désaccord : un détail vrai mais peu « sinusoïdal » (pore,
+    cicatrice, minutie), présent dans toutes les poses, n'est pas touché."""
+    f = _etirer(brute)
+    if periode is None:
+        periode = periode_cretes(brute)
+    bande = _passe_bande(f, periode)
+    theta = orientation_cretes(bande, periode)
+
+    # réponse du Gabor dans l'orientation locale (la plus proche du banc)
+    noyaux = _noyaux_gabor(periode)
+    indices = np.rint(theta * NB_ORIENTATIONS / np.pi).astype(np.int32) \
+        % NB_ORIENTATIONS
+    modele = np.zeros_like(bande)
+    for k, noyau in enumerate(noyaux):
+        zone = indices == k
+        if not zone.any():
+            continue
+        reponse = cv2.filter2D(bande, -1, noyau, borderType=cv2.BORDER_REFLECT)
+        modele[zone] = reponse[zone]
+
+    s = SIGMA_PLAUSIBILITE * periode
+    fm = cv2.GaussianBlur(bande * modele, (0, 0), s)
+    ff = cv2.GaussianBlur(bande * bande, (0, 0), s)
+    mm = cv2.GaussianBlur(modele * modele, (0, 0), s)
+    # epsilon ~ (énergie d'une zone vide)^2 : une zone plate tombe à 0
+    eps = (0.5 * QUALITE_BASSE * QUALITE_BASSE) ** 2
+    plausibilite = np.clip(fm * fm / (ff * mm + eps), 0.0, 1.0)
+    # le pourtour d'une tache est suspect aussi (c'est là que le désaccord
+    # avec les autres poses déborde) : minimum sur ~0,8 période
+    diametre = int(EROSION_PLAUSIBILITE * periode) | 1
+    if diametre >= 3:
+        plausibilite = cv2.erode(plausibilite, cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (diametre, diametre)))
+    return _ajuster_taille(plausibilite, taille)
 
 
 def aligner_sift(reference, image, masque_ref, masque_img):
@@ -224,7 +380,12 @@ def aligner_correlation(reference, image, masque_img=None, masque_ref=None):
 
 class SessionFusion:
     """Mosaïque incrémentale : on ajoute les scans un par un, chacun se
-    raccorde à ce qui est déjà posé."""
+    raccorde à ce qui est déjà posé.
+
+    Chaque pose acceptée reste en mémoire comme une COUCHE alignée (bloc de
+    toile warpé, poids, netteté, plausibilité, crêtes signées) : la mosaïque
+    affichée est à tout moment le consensus de toutes les couches, recalculé
+    dans l'emprise de chaque nouvelle pose (§ _recomposer)."""
 
     def __init__(self):
         self.numerateur = None
@@ -234,6 +395,9 @@ class SessionFusion:
         self.qualite_num = None     # netteté accumulée (à diviser par le poids)
         self.H = self.W = 0
         self.nb_posees = 0
+        self.couches = []           # une entrée par pose acceptée (§ _deposer)
+        self.captures = []          # captures BRUTES acceptées, dans l'ordre
+        self.periode = PERIODE_DEFAUT * 2   # période des crêtes sur la toile
 
     def ajouter(self, capture_brute):
         """Améliore, aligne et fond une capture (niveaux de gris numpy).
@@ -242,12 +406,15 @@ class SessionFusion:
         masque = masque_doigt(traitee)
         if int((masque > 0).sum()) < 2000:
             return False                      # capture quasi vide
-        qualite = carte_qualite(capture_brute, traitee.shape)
+        periode = periode_cretes(capture_brute)
+        qualite = carte_qualite(capture_brute, traitee.shape, periode)
+        plausibilite = carte_plausibilite(capture_brute, traitee.shape, periode)
         h, w = traitee.shape
 
         if self.numerateur is None:
-            # première pose : grande toile, capture au centre
-            self.H, self.W = h * 3, w * 3
+            # première pose : grande toile (dimensions paires, le consensus
+            # travaille en demi-résolution), capture au centre
+            self.H, self.W = (h * 3 + 1) & ~1, (w * 3 + 1) & ~1
             self.numerateur = np.zeros((self.H, self.W), np.float64)
             self.denominateur = np.zeros((self.H, self.W), np.float64)
             self.couverture = np.zeros((self.H, self.W), np.float32)
@@ -281,7 +448,9 @@ class SessionFusion:
                       " il faut > 0.35 — recouvre mieux la zone déjà scannée)")
                 return False
 
-        self._deposer(traitee, masque, M, qualite)
+        # l'image améliorée est agrandie 2x : la période sur la toile l'est aussi
+        self._deposer(traitee, masque, M, qualite, plausibilite, 2.0 * periode)
+        self.captures.append(np.array(capture_brute, dtype=np.uint8, copy=True))
         self.nb_posees += 1
         return True
 
@@ -333,21 +502,27 @@ class SessionFusion:
         h, w = forme
         coins = np.float32([[0, 0], [w, 0], [0, h], [w, h]])
         projetes = coins @ M[:, :2].T.astype(np.float32) + M[:, 2]
-        x0 = max(int(np.floor(projetes[:, 0].min())) - 2, 0)
-        x1 = min(int(np.ceil(projetes[:, 0].max())) + 2, self.W)
-        y0 = max(int(np.floor(projetes[:, 1].min())) - 2, 0)
-        y1 = min(int(np.ceil(projetes[:, 1].max())) + 2, self.H)
+        # coordonnées PAIRES : le consensus se calcule en demi-résolution, et
+        # un redimensionnement exactement 1/2 est 50x plus rapide qu'un autre
+        x0 = max(int(np.floor(projetes[:, 0].min())) - 2, 0) & ~1
+        x1 = min((int(np.ceil(projetes[:, 0].max())) + 3) & ~1, self.W)
+        y0 = max(int(np.floor(projetes[:, 1].min())) - 2, 0) & ~1
+        y1 = min((int(np.ceil(projetes[:, 1].max())) + 3) & ~1, self.H)
         return y0, y1, x0, x1
 
-    def _deposer(self, image, masque, M, qualite=None):
-        """Fond une pose dans la mosaïque en la COMPLÉTANT :
-          - là où la toile est vide, la pose remplit ;
-          - là où il y a déjà des crêtes, c'est la plus nette des deux qui
-            l'emporte, avec priorité à l'existant à qualité égale.
-        Le passage de l'un à l'autre est progressif (carte de distance +
-        montée en confiance) pour que la couture reste invisible."""
+    def _deposer(self, image, masque, M, qualite=None, plausibilite=None,
+                 periode=None):
+        """Range une pose alignée comme nouvelle COUCHE (bloc de toile warpé
+        + poids géométrique + netteté + plausibilité + crêtes signées), puis
+        recompose la mosaïque dans son emprise à partir de toutes les couches
+        (§ _recomposer). Le poids géométrique rogne et fond le bord de pose
+        pour que la couture reste invisible."""
         if qualite is None:
             qualite = np.ones(image.shape, np.float32)
+        if plausibilite is None:
+            plausibilite = np.ones(image.shape, np.float32)
+        if periode is None:
+            periode = self.periode
         # 1. poids géométrique : bord de pose rogné puis fondu jusqu'au coeur.
         #    Le contact du doigt est toujours douteux sur son pourtour — et le
         #    bord de l'IMAGE en est un aussi, puisque la capture s'arrête là.
@@ -364,11 +539,9 @@ class SessionFusion:
         poids = np.clip((distance - EROSION_BORD) / FONDU_BORD, 0.0, 1.0)
         poids = poids.astype(np.float32)
 
-        # 2. pondération par la netteté locale des crêtes ; le plancher garantit
-        #    qu'une pose pâle couvre quand même la zone (sinon, trou blanc)
-        poids_qualite = poids * (PLANCHER_QUALITE
-                                 + (1.0 - PLANCHER_QUALITE) * qualite)
-
+        # 2. la pondération par la netteté locale et l'arbitrage entre poses
+        #    se font à la recomposition (§ _recomposer), à partir des cartes
+        #    gardées ci-dessous
         y0, y1, x0, x1 = self._emprise(image.shape, M)
         if y1 <= y0 or x1 <= x0:
             return
@@ -383,26 +556,186 @@ class SessionFusion:
 
         image_t = vers_bloc(image.astype(np.float32))
         poids_t = vers_bloc(poids)
-        poids_q_t = vers_bloc(poids_qualite.astype(np.float32))
         qualite_t = vers_bloc(qualite.astype(np.float32))
+        plausibilite_t = vers_bloc(plausibilite.astype(np.float32))
 
-        # 3. arbitrage avec ce qui est déjà posé, pixel par pixel.
-        couverture = self.couverture[y0:y1, x0:x1]
-        deja = np.maximum(self.denominateur[y0:y1, x0:x1], 1e-6).astype(np.float32)
-        qualite_deja = np.clip(self.qualite_num[y0:y1, x0:x1] / deja, 0.0, 1.0)
-        # la mosaïque n'est crédible que là où elle a du poids : sur son propre
-        # bord en fondu, la confiance remonte doucement -> pas de marche
-        qualite_deja *= np.clip(couverture / SEUIL_CONFIANCE, 0.0, 1.0)
+        # 3. crêtes signées normalisées (bande des crêtes / amplitude locale) :
+        #    c'est là-dessus que les poses se comparent, insensible au
+        #    contraste. Des crêtes franches donnent ~±1 ; le plancher
+        #    d'amplitude évite de gonfler le bruit d'une zone pâle.
+        bande = _passe_bande(image_t, periode)
+        amplitude = np.sqrt(np.maximum(
+            cv2.GaussianBlur(bande * bande, (0, 0), periode), 0.0))
+        echelle = (AMPLITUDE_REFERENCE + AMPLITUDE_PLANCHER) / AMPLITUDE_REFERENCE
+        cretes_t = bande * echelle / (amplitude + AMPLITUDE_PLANCHER)
 
-        avantage = (qualite_t - qualite_deja) / (qualite_deja + 0.15)
-        facteur = PLANCHER_ARBITRAGE + (1.0 - PLANCHER_ARBITRAGE) / (
-            1.0 + np.exp(-PENTE_ARBITRAGE * (avantage - BIAIS_ARBITRAGE)))
-        poids_q_t = poids_q_t * facteur.astype(np.float32)
+        # les cartes qui ne servent qu'au consensus sont gardées en
+        # demi-résolution (l'emprise a des dimensions paires, cf. _emprise)
+        demi = (taille[0] // 2, taille[1] // 2)
 
-        self.numerateur[y0:y1, x0:x1] += image_t.astype(np.float64) * poids_q_t
-        self.denominateur[y0:y1, x0:x1] += poids_q_t
-        self.couverture[y0:y1, x0:x1] += poids_t
-        self.qualite_num[y0:y1, x0:x1] += poids_q_t * qualite_t
+        def en_demi(carte):
+            return cv2.resize(carte, demi, interpolation=cv2.INTER_AREA)
+
+        self.couches.append({
+            "y0": y0, "y1": y1, "x0": x0, "x1": x1, "M": M.copy(),
+            "image": image_t, "poids": poids_t, "qualite": qualite_t,
+            "plausibilite_demi": en_demi(plausibilite_t),
+            "cretes_demi": en_demi(cretes_t), "periode": float(periode)})
+        self.periode = float(np.median([c["periode"] for c in self.couches]))
+        self._recomposer(y0, y1, x0, x1)
+
+    def _couche_sur(self, couche, y0, y1, x0, x1, cle, demi=False):
+        """Le bloc `cle` d'une couche, découpé/complété à zéro sur la zone
+        (en demi-résolution pour les cartes *_demi : toutes les coordonnées
+        d'emprise sont paires)."""
+        r = 2 if demi else 1
+        bloc = np.zeros(((y1 - y0) // r, (x1 - x0) // r), np.float32)
+        iy0, iy1 = max(y0, couche["y0"]), min(y1, couche["y1"])
+        ix0, ix1 = max(x0, couche["x0"]), min(x1, couche["x1"])
+        if iy1 > iy0 and ix1 > ix0:
+            bloc[(iy0 - y0) // r:(iy1 - y0) // r,
+                 (ix0 - x0) // r:(ix1 - x0) // r] = couche[cle][
+                (iy0 - couche["y0"]) // r:(iy1 - couche["y0"]) // r,
+                (ix0 - couche["x0"]) // r:(ix1 - couche["x0"]) // r]
+        return bloc
+
+    def _recomposer(self, y0, y1, x0, x1):
+        """Recalcule la mosaïque sur une zone de la toile comme CONSENSUS de
+        toutes les couches qui la touchent :
+          1. poids de base = géométrie x netteté (une pose pâle couvre quand
+             même) ; puis arbitrage par netteté, symétrique entre les poses :
+             la plus nette l'emporte, un bord flou perd sa voix ;
+          2. désaccord local : résidu entre les crêtes d'une pose et
+             l'estimation des AUTRES, lissé sur ~1 période ;
+          3. là où il y a désaccord, la pose la plus plausible l'emporte
+             (sigmoïde sur la plausibilité) et, à 3 poses ou plus, celle qui
+             s'écarte nettement plus que les autres perd sa voix (vote
+             robuste, repondéré) ;
+          4. la référence de netteté ignore les poses contredites, et à 3
+             poses ou plus une 2e passe recalcule l'estimation avec les poids
+             corrigés.
+        Là où une seule pose existe, ou là où elles sont d'accord, le poids de
+        base reste tel quel : rien n'est jamais perdu sans contradiction.
+
+        Les cartes de poids sont lisses à l'échelle de la demi-période : tout
+        l'arbitrage se calcule en DEMI-résolution (4x moins de calcul), seule
+        la composition finale se fait sur les pixels de la toile."""
+        couches = [c for c in self.couches
+                   if c["y1"] > y0 and c["y0"] < y1 and c["x1"] > x0 and c["x0"] < x1]
+        if not couches:
+            return
+        zone = (y0, y1, x0, x1)
+        poids = [self._couche_sur(c, *zone, "poids") for c in couches]
+        images = [self._couche_sur(c, *zone, "image") for c in couches]
+        qualite = [self._couche_sur(c, *zone, "qualite") for c in couches]
+
+        # poids de base = géométrie x netteté ; le plancher garantit qu'une
+        # pose pâle couvre quand même la zone (sinon, trou blanc)
+        def base_de(poids_, qualite_):
+            return poids_ * (PLANCHER_QUALITE + (1.0 - PLANCHER_QUALITE) * qualite_)
+
+        if len(couches) == 1:
+            w = [base_de(poids[0], qualite[0])]
+        else:
+            h, l = y1 - y0, x1 - x0                 # pairs (cf. _emprise)
+            hp, lp = h // 2, l // 2
+
+            def petit(carte):
+                return cv2.resize(carte, (lp, hp), interpolation=cv2.INTER_AREA)
+
+            poids_p = [petit(p) for p in poids]
+            qualite_p = [petit(q) for q in qualite]
+            base = [base_de(p, q) for p, q in zip(poids_p, qualite_p)]
+            # 1. arbitrage par netteté (symétrique) : la pose la plus nette fait
+            #    référence ; une pose n'est crédible que là où elle a du poids,
+            #    sur son bord en fondu sa netteté compte progressivement
+            confiance = [np.clip(p / SEUIL_CONFIANCE, 0.0, 1.0) for p in poids_p]
+            q_eff = [q * cf for q, cf in zip(qualite_p, confiance)]
+
+            cretes = [self._couche_sur(c, *zone, "cretes_demi", demi=True)
+                      for c in couches]
+            # plausibilité effective : une pose n'est crédible que là où elle a
+            # du poids (son bord en fondu plaide moins) ; la référence est la
+            # meilleure des poses présentes, chacune est jugée par rapport à elle
+            plaus = [self._couche_sur(c, *zone, "plausibilite_demi", demi=True) * cf
+                     for c, cf in zip(couches, confiance)]
+            p_ref = np.maximum.reduce(plaus)
+            # là où AUCUNE pose n'a de crêtes plausibles, la netteté ne veut
+            # plus rien dire (une tache a de l'énergie...) : on n'arbitre plus
+            credible = np.clip(p_ref / PLAUSIBILITE_MINI, 0.0, 1.0)
+
+            def arbitrage(q_ref):
+                facteurs = []
+                for q in q_eff:
+                    avantage = (q - q_ref) / (q_ref + 0.15)
+                    facteur = PLANCHER_ARBITRAGE + (1.0 - PLANCHER_ARBITRAGE) / (
+                        1.0 + np.exp(-PENTE_ARBITRAGE * (avantage + BIAIS_ARBITRAGE)))
+                    facteurs.append((1.0 + credible * (facteur - 1.0))
+                                    .astype(np.float32))
+                return facteurs
+
+            s = [1.0 / (1.0 + np.exp(-PENTE_PLAUSIBILITE
+                                     * (pl - p_ref + BIAIS_PLAUSIBILITE)))
+                 for pl in plaus]
+            # « quelqu'un en face » : d'autres poses ont du poids ici (fixé
+            # d'après les poids de base, il ne bouge pas d'une passe à l'autre)
+            sigma_r = 0.25 * self.periode             # demi-période, en demi-res
+            somme_base = np.add.reduce(base)
+            presences, normes = [], []
+            for b in base:
+                en_face = (somme_base - b > 0.02).astype(np.float32)
+                presences.append(en_face)
+                normes.append(np.maximum(cv2.GaussianBlur(en_face, (0, 0), sigma_r),
+                                         0.2))
+
+            facteurs = arbitrage(np.maximum.reduce(q_eff))
+            w = [b * f for b, f in zip(base, facteurs)]
+            # à 2 poses, l'estimation « de l'autre » ne dépend pas des poids :
+            # une seule passe suffit
+            passes = ITERATIONS_CONSENSUS if len(couches) > 2 else 1
+            for _ in range(passes):
+                somme_w = np.add.reduce(w)
+                somme_wc = np.add.reduce([wi * ci for wi, ci in zip(w, cretes)])
+                residus = []
+                for wi, ci, en_face, norme in zip(w, cretes, presences, normes):
+                    # 2. estimation des AUTRES poses (sans celle-ci) et résidu
+                    #    lissé sur ~1 période, là où il y a quelqu'un en face
+                    autres = somme_w - wi
+                    estimation = (somme_wc - wi * ci) / np.maximum(autres, 1e-6)
+                    ecart = np.abs(ci - estimation) * en_face
+                    residus.append(cv2.GaussianBlur(ecart, (0, 0), sigma_r)
+                                   / norme * en_face)
+                # échelle du vote robuste : le résidu moyen des poses présentes
+                # (dans une zone bruitée, tout le monde s'écarte un peu ; seule
+                # la pose qui s'écarte nettement plus que les autres est rejetée)
+                echelle = np.maximum(np.add.reduce(residus)
+                                     / np.maximum(np.add.reduce(presences), 1.0),
+                                     SIGMA_ROBUSTE)
+                correction = []
+                for residu, si in zip(residus, s):
+                    desaccord = np.clip((residu - DESACCORD_BAS)
+                                        / (DESACCORD_HAUT - DESACCORD_BAS),
+                                        0.0, 1.0)
+                    # 3. en cas de désaccord : plausibilité et vote robuste
+                    robuste = 1.0 / (1.0 + (residu / echelle) ** 4)
+                    correction.append(((1.0 - desaccord)
+                                       + desaccord * si * robuste).astype(np.float32))
+                # 4. la référence de netteté ignore les poses contredites : une
+                #    tache a de l'énergie dans la bande des crêtes et passe pour
+                #    « nette », elle ne doit pas rabaisser les poses saines
+                facteurs = arbitrage(np.maximum.reduce(
+                    [q * c for q, c in zip(q_eff, correction)]))
+                w = [b * f * c for b, f, c in zip(base, facteurs, correction)]
+            # retour à la pleine résolution ; le poids reste nul hors de la pose
+            w = [cv2.resize(wi, (l, h), interpolation=cv2.INTER_LINEAR) * (p > 0)
+                 for wi, p in zip(w, poids)]
+
+        self.numerateur[y0:y1, x0:x1] = np.add.reduce(
+            [wi.astype(np.float64) * im for wi, im in zip(w, images)])
+        self.denominateur[y0:y1, x0:x1] = np.add.reduce(w).astype(np.float64)
+        self.couverture[y0:y1, x0:x1] = np.add.reduce(poids)
+        self.qualite_num[y0:y1, x0:x1] = np.add.reduce(
+            [wi * q for wi, q in zip(w, qualite)])
 
     def image_actuelle(self):
         couvert = self.couverture > 0.05
@@ -493,16 +826,30 @@ def finaliser_et_enregistrer(session):
     return enregistrer_resultat(mosaique, cretes)
 
 
+def session_depuis_captures(captures, ordre_couverture=True):
+    """Re-fusionne une liste de captures BRUTES (numpy uint8) dans une
+    SessionFusion neuve — pour refaire la mosaïque à partir des poses
+    sauvées sur disque (session.captures). Par défaut on commence par la
+    plus couverte, comme en mode lot ; ordre_couverture=False garde l'ordre
+    donné (celui des poses en direct). Retourne la session."""
+    if ordre_couverture:
+        aires = [int((masque_doigt(ameliorer_empreinte.ameliorer(c)) > 0).sum())
+                 for c in captures]
+        ordre = [int(i) for i in np.argsort(aires)[::-1]]
+    else:
+        ordre = list(range(len(captures)))
+    session = SessionFusion()
+    for i in ordre:
+        raccordee = session.ajouter(captures[i])
+        print(f"   capture {i + 1} : "
+              f"{'raccordée' if raccordee else 'impossible à raccorder, ignorée'}")
+    return session
+
+
 def fusionner_et_enregistrer(captures):
     """Mode lot : fusionne une liste d'images numpy en commençant par la
     plus couverte. Retourne le chemin du montage, ou None."""
-    aires = [int((masque_doigt(ameliorer_empreinte.ameliorer(c)) > 0).sum())
-             for c in captures]
-    session = SessionFusion()
-    for i in np.argsort(aires)[::-1]:
-        raccordee = session.ajouter(captures[int(i)])
-        print(f"   capture {int(i) + 1} : "
-              f"{'raccordée' if raccordee else 'impossible à raccorder, ignorée'}")
+    session = session_depuis_captures(captures)
     if session.nb_posees < 2:
         return None
     return finaliser_et_enregistrer(session)
