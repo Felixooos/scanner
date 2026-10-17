@@ -21,10 +21,19 @@ Logique :
 
 Utilisation :
     python3 tracer_svg.py photos/xxx_cretes.png [sortie.svg]
+
+VITESSE (même tracé, au bit près, que le calcul d'origine) : les tracés et
+leur première moitié (squelette, pontages) sont gardés en mémoire selon le
+contenu exact de l'image (voir CACHE_ACTIF) ; le graphe du squelette est lu
+par numpy, l'ébarbage ne suit que les culs-de-sac, l'amincissement ne
+parcourt que la boîte des crêtes.
 """
 
+import hashlib
 import os
 import sys
+import threading
+from collections import OrderedDict
 
 import cv2
 import numpy as np
@@ -194,6 +203,76 @@ ANNEAU_MINI = 24          # nb mini de cases du spectre dans un anneau pour
                           # qu'il compte (voir periode_cretes) : en dessous on
                           # ne mesure plus les crêtes mais la forme du doigt
 
+# --- Mémoire des calculs déjà faits ----------------------------------------
+# Dans l'app, le même moteur reste ouvert : changer de style, revenir à une
+# forme déjà vue, retoucher UNE empreinte d'une commande qui en compte trois…
+# redemande sans cesse les mêmes tracés. On les garde, repérés par le CONTENU
+# exact des images (hash des pixels) et par TOUS les réglages ci-dessus : une
+# image ou un réglage différent, même d'un pixel, refait le calcul.
+CACHE_ACTIF = True             # False = tout recalculer à chaque fois
+MEMOIRE_TRAITS_MAX = 48        # tracés finis gardés (quelques Ko chacun)
+MEMOIRE_PREPARATION_MAX = 24   # premières moitiés de tracé gardées
+MEMOIRE_PERIODE_MAX = 32       # interlignes mesurés gardés
+
+_MEMOIRE_TRAITS = OrderedDict()
+_MEMOIRE_PREPARATION = OrderedDict()
+_MEMOIRE_PERIODE = OrderedDict()
+
+
+def _reglages_du_module(module_globals):
+    """Texte qui résume les réglages (constantes en MAJUSCULES) d'un module :
+    il entre dans la clé de mémoire, si bien qu'un réglage modifié en cours de
+    route (essais, calibrage) n'est jamais servi avec un ancien résultat."""
+    elements = list(module_globals.items())       # copie d'un bloc (fils)
+    return repr(sorted((k, v) for k, v in elements
+                       if k.isupper() and not k.startswith("_")
+                       and isinstance(v, (bool, int, float, str))))
+
+
+def _cle_contenu(*elements, reglages=None):
+    """Clé de mémoire = empreinte (hash) du CONTENU : pixels, forme et type
+    des images, valeurs simples, et réglages du module (voir plus haut)."""
+    h = hashlib.blake2b(digest_size=20)
+    for e in elements:
+        if isinstance(e, np.ndarray):
+            a = np.ascontiguousarray(e)
+            h.update(f"<{a.dtype.str}{a.shape}>".encode())
+            h.update(a.reshape(-1).view(np.uint8))
+        else:
+            h.update(f"<{e!r}>".encode())
+    h.update((reglages if reglages is not None
+              else _reglages_du_module(globals())).encode())
+    return h.digest()
+
+
+_VERROU_MEMOIRE = threading.RLock()   # la mémoire peut servir à plusieurs fils
+
+
+def _lire_memoire(memoire, cle):
+    """Valeur gardée sous cette clé (et rafraîchie), ou None."""
+    with _VERROU_MEMOIRE:
+        valeur = memoire.get(cle)
+        if valeur is not None:
+            memoire.move_to_end(cle)
+        return valeur
+
+
+def _ranger_memoire(memoire, cle, valeur, maximum):
+    """Garde la valeur ; oublie les plus anciennes au-delà de `maximum`."""
+    with _VERROU_MEMOIRE:
+        memoire[cle] = valeur
+        memoire.move_to_end(cle)
+        while len(memoire) > max(0, int(maximum)):
+            memoire.popitem(last=False)
+
+
+def vider_cache():
+    """Oublie tous les tracés gardés en mémoire."""
+    with _VERROU_MEMOIRE:
+        _MEMOIRE_TRAITS.clear()
+        _MEMOIRE_PREPARATION.clear()
+        _MEMOIRE_PERIODE.clear()
+
 
 def longueur(points):
     if len(points) < 2:
@@ -231,16 +310,31 @@ def pas_pour(periode):
 
 DIRS_8 = [(-1, -1), (-1, 0), (-1, 1), (0, -1),
           (0, 1), (1, -1), (1, 0), (1, 1)]
+# pour chacun des 256 voisinages possibles (1 bit par direction de DIRS_8,
+# dans cet ordre) : la liste des décalages présents, dans l'ordre de DIRS_8
+_DECALAGES = [[d for b, d in enumerate(DIRS_8) if code >> b & 1]
+              for code in range(256)]
 
 
 def _graphe_squelette(squelette):
-    """Voisinage 8-connexe du squelette : {pixel (y, x) -> [voisins]}."""
-    pixels = set(zip(*np.nonzero(squelette)))       # ensembles de (y, x)
+    """Voisinage 8-connexe du squelette : {pixel (y, x) -> [voisins]}.
+    Les voisins sont lus d'un coup par numpy (un code 8 bits par pixel) ;
+    les pixels sont des entiers Python, insérés dans le MÊME ordre qu'avant
+    (celui de np.nonzero) : l'ensemble se parcourt donc dans le même ordre
+    et tout le tracé qui en découle est inchangé."""
+    sq = np.asarray(squelette)
+    ys, xs = np.nonzero(sq)
+    plein = np.zeros((sq.shape[0] + 2, sq.shape[1] + 2), bool)
+    plein[1:-1, 1:-1] = sq != 0
+    code = np.zeros(len(ys), np.int64)
+    for b, (dy, dx) in enumerate(DIRS_8):
+        code |= plein[ys + 1 + dy, xs + 1 + dx].astype(np.int64) << b
+    cles = list(zip(ys.tolist(), xs.tolist()))
+    pixels = set(cles)                              # ensembles de (y, x)
     voisins = {}
-    for p in pixels:
+    for p, c in zip(cles, code.tolist()):
         y, x = p
-        voisins[p] = [(y + dy, x + dx) for dy, dx in DIRS_8
-                      if (y + dy, x + dx) in pixels]
+        voisins[p] = [(y + dy, x + dx) for dy, dx in _DECALAGES[c]]
     return pixels, voisins
 
 
@@ -265,8 +359,10 @@ def _clusters_noeuds(pixels, voisins):
                 if r in ensemble and r not in ident:
                     ident[r] = k
                     pile.append(r)
-        centres[k] = (float(np.mean([m[1] for m in membres])),
-                      float(np.mean([m[0] for m in membres])))   # (x, y)
+        # moyenne d'entiers : somme exacte puis une division, exactement la
+        # valeur que donnait np.mean (en bien plus rapide sur ces petites listes)
+        centres[k] = (sum(m[1] for m in membres) / len(membres),
+                      sum(m[0] for m in membres) / len(membres))   # (x, y)
     return ident, centres
 
 
@@ -290,11 +386,10 @@ def _suivre_aretes(pixels, voisins, ident):
                 if cur in ident:                    # autre carrefour atteint
                     faites.add((cur, prec))         # marque le sens inverse
                     break
-                suites = [q for q in voisins[cur] if q != prec]
-                if not suites:
-                    break
-                prec, cur = cur, min(
-                    suites, key=lambda q: (q[0] - cur[0]) ** 2 + (q[1] - cur[1]) ** 2)
+                # hors carrefour, un pixel a exactement 2 voisins (sinon ce
+                # serait un nœud) dont celui d'où l'on vient : on prend l'autre
+                q1, q2 = voisins[cur]
+                prec, cur = cur, (q2 if q1 == prec else q1)
             chemins.append((chaine, ident[n], ident.get(chaine[-1])))
 
     # boucles fermées : composantes sans aucun nœud (que des pixels degré 2)
@@ -334,35 +429,96 @@ def ebarber(squelette, longueur_max):
         return squelette
     sq = np.asarray(squelette).copy()
     for _ in range(3):
-        pixels, voisins = _graphe_squelette(sq)
-        if not pixels:
-            break
-        ident, _ = _clusters_noeuds(pixels, voisins)
-        aretes = _suivre_aretes(pixels, voisins, ident)
-        branches = {}                               # branches par carrefour
-        for _chaine, a, b in aretes:
-            for k in (a, b):
-                if k is not None:
-                    branches[k] = branches.get(k, 0) + 1
-        a_retirer = set()
-        for chaine, a, b in aretes:
-            if a is None or b is None or a == b:
-                continue
-            da, db = branches.get(a, 0), branches.get(b, 0)
-            # une barbe : un cul-de-sac greffé sur un carrefour
-            if not (min(da, db) == 1 and max(da, db) >= 3):
-                continue
-            if _longueur_chaine(chaine) > longueur_max:
-                continue
-            impasse = a if da == 1 else b
-            # on garde le carrefour, on n'efface que la barbe elle-même
-            a_retirer.update(p for p in chaine
-                             if ident.get(p, impasse) == impasse)
+        a_retirer = _barbes(sq, longueur_max)
         if not a_retirer:
             break
         for y, x in a_retirer:
             sq[y, x] = False
     return sq
+
+
+_DEGRE = np.array([len(d) for d in _DECALAGES], np.int64)
+
+
+def _barbes(sq, longueur_max):
+    """Pixels des barbes à effacer (une passe d'ebarber).
+
+    Le résultat ne dépend d'AUCUN ordre de parcours : une barbe est une
+    branche qui relie un carrefour d'où ne part qu'UNE branche (un cul-de-
+    sac) à un carrefour d'où en partent au moins 3. Le nombre de branches
+    d'un carrefour est simplement le nombre de couples (pixel du carrefour,
+    voisin hors du carrefour) — chaque branche est comptée à chacun de ses
+    bouts. On le calcule d'un bloc, puis on ne suit pixel à pixel que les
+    branches qui partent d'un cul-de-sac (au lieu de tout le squelette).
+    Mêmes pixels effacés que l'ancien parcours complet."""
+    ys, xs = np.nonzero(sq)
+    if not len(ys):
+        return set()
+    h, w = sq.shape
+    plein = np.zeros((h + 2, w + 2), bool)
+    plein[1:-1, 1:-1] = sq != 0
+    code = np.zeros(len(ys), np.int64)
+    for b, (dy, dx) in enumerate(DIRS_8):
+        code |= plein[ys + 1 + dy, xs + 1 + dx].astype(np.int64) << b
+    noeud = _DEGRE[code] != 2
+    # carrefours = groupes 8-connexes de pixels-nœuds (comme _clusters_noeuds)
+    carte = np.zeros((h, w), np.uint8)
+    carte[ys[noeud], xs[noeud]] = 1
+    nb, etiquettes = cv2.connectedComponents(carte, connectivity=8,
+                                             ltype=cv2.CV_32S)
+    etiq = np.zeros((h + 2, w + 2), np.int32)
+    etiq[1:-1, 1:-1] = etiquettes
+    mien = etiquettes[ys, xs]                       # 0 = pixel ordinaire
+    sortants = np.zeros(len(ys), np.int64)          # voisins hors carrefour
+    for b, (dy, dx) in enumerate(DIRS_8):
+        present = (code >> b) & 1
+        sortants += present * (etiq[ys + 1 + dy, xs + 1 + dx] != mien)
+    branches = np.bincount(mien[noeud], weights=sortants[noeud],
+                           minlength=nb).astype(np.int64)
+    # départs : le seul pixel d'un cul-de-sac (carrefour à 1 branche) qui
+    # a un voisin dehors
+    departs = np.flatnonzero(noeud & (sortants > 0))
+    departs = departs[branches[mien[departs]] == 1]
+    if not len(departs):
+        return set()
+    codes = np.zeros((h + 2, w + 2), np.int64)      # voisinage de chaque pixel
+    codes[ys + 1, xs + 1] = code
+    a_retirer = set()
+    for i in departs.tolist():
+        y, x = int(ys[i]), int(xs[i])
+        cul = int(mien[i])
+        suivant = None
+        for dy, dx in _DECALAGES[int(code[i])]:
+            if etiq[y + 1 + dy, x + 1 + dx] != cul:
+                suivant = (y + dy, x + dx)
+                break
+        chaine = [(y, x), suivant]
+        # longueur cumulée dans l'ordre de la chaîne, comme _longueur_chaine ;
+        # au-delà de longueur_max ce n'est plus une barbe : inutile d'aller
+        # plus loin (les vraies fins de crête sont longues)
+        total = 1.4142135623730951 if (y != suivant[0] and x != suivant[1]) \
+            else 1.0
+        prec, cur = (y, x), suivant
+        trop_long = total > longueur_max
+        while not trop_long and etiq[cur[0] + 1, cur[1] + 1] == 0:
+            suite = [(cur[0] + dy, cur[1] + dx)          # pixel de degré 2
+                     for dy, dx in _DECALAGES[int(codes[cur[0] + 1, cur[1] + 1])]
+                     if (cur[0] + dy, cur[1] + dx) != prec]
+            if not suite:
+                break
+            prec, cur = cur, suite[0]
+            chaine.append(cur)
+            total += 1.4142135623730951 if (prec[0] != cur[0]
+                                             and prec[1] != cur[1]) else 1.0
+            trop_long = total > longueur_max
+        if trop_long:
+            continue
+        arrivee = int(etiq[cur[0] + 1, cur[1] + 1])
+        if arrivee == 0 or arrivee == cul or branches[arrivee] < 3:
+            continue
+        # on garde le carrefour d'arrivée, on n'efface que la barbe
+        a_retirer.update(chaine[:-1])
+    return a_retirer
 
 
 def extraire_lignes_avec_noeuds(squelette):
@@ -401,13 +557,58 @@ def extraire_lignes(squelette):
 def periode_cretes(cretes, defaut=PERIODE_DEFAUT):
     """Interligne moyen des crêtes (px), lu sur le pic du PROFIL RADIAL du
     spectre : une moyenne par longueur d'onde, donc insensible à un pixel de
-    bruit isolé. Mesuré sur la seule zone qui porte des crêtes."""
+    bruit isolé. Mesuré sur la seule zone qui porte des crêtes.
+    (Gardé en mémoire : le rendu le demande plusieurs fois par empreinte.)"""
+    if not CACHE_ACTIF:
+        return _mesurer_periode(cretes, defaut)
+    cle = _cle_contenu("periode", np.asarray(cretes), float(defaut))
+    deja = _lire_memoire(_MEMOIRE_PERIODE, cle)
+    if deja is None:
+        deja = _mesurer_periode(cretes, defaut)
+        _ranger_memoire(_MEMOIRE_PERIODE, cle, deja, MEMOIRE_PERIODE_MAX)
+    return deja
+
+
+def _energie_anneaux(spectre, rayon, ondes, compte_mini=1):
+    """Profil radial du spectre : energie[i] = moyenne de `spectre` sur
+    l'anneau 1/(onde+0.5) < rayon <= 1/(onde-0.5) de ondes[i], laissée à 0
+    s'il compte moins de `compte_mini` cases.
+    C'est exactement la boucle « anneau par anneau » d'origine (mêmes bornes,
+    calculées par les mêmes opérations ; mêmes cases, sommées dans le même
+    ordre), mais en un seul passage sur le spectre au lieu d'un par anneau."""
+    energie = np.zeros_like(ondes)
+    hauts = np.array([1.0 / (onde - 0.5) for onde in ondes])
+    bas = np.array([1.0 / (onde + 0.5) for onde in ondes])
+    if len(ondes) < 2 or not np.array_equal(bas[:-1], hauts[1:]) \
+            or np.any(np.diff(hauts) >= 0):
+        for i, onde in enumerate(ondes):       # anneaux non jointifs : boucle
+            anneau = (rayon > 1.0 / (onde + 0.5)) & (rayon <= 1.0 / (onde - 0.5))
+            if int(anneau.sum()) >= max(1, compte_mini):
+                energie[i] = float(spectre[anneau].mean())
+        return energie
+    plat = np.asarray(rayon).reshape(-1)
+    cases = np.flatnonzero((plat > bas[-1]) & (plat <= hauts[0]))
+    croissants = hauts[::-1].astype(np.float64)
+    rang = len(ondes) - 1 - np.searchsorted(croissants, plat[cases], side="left")
+    ordre = np.argsort(rang, kind="stable")       # ordre ligne par ligne gardé
+    valeurs = np.asarray(spectre).reshape(-1)[cases][ordre]
+    comptes = np.bincount(rang, minlength=len(ondes))
+    debuts = np.concatenate([[0], np.cumsum(comptes)])
+    for i in range(len(ondes)):
+        if comptes[i] >= max(1, compte_mini):
+            energie[i] = float(valeurs[debuts[i]:debuts[i + 1]].mean())
+    return energie
+
+
+def _mesurer_periode(cretes, defaut=PERIODE_DEFAUT):
+    """Le calcul de periode_cretes (voir ci-dessus)."""
     masque = np.asarray(cretes) < 128
-    if int(masque.sum()) < 500:
+    if int(np.count_nonzero(masque)) < 500:
         return defaut
-    lignes, colonnes = np.where(masque)
-    f = masque[lignes.min():lignes.max() + 1,
-               colonnes.min():colonnes.max() + 1].astype(np.float32)
+    lignes = np.flatnonzero(masque.any(axis=1))
+    colonnes = np.flatnonzero(masque.any(axis=0))
+    f = masque[lignes[0]:lignes[-1] + 1,
+               colonnes[0]:colonnes[-1] + 1].astype(np.float32)
     if min(f.shape) < 48:
         return defaut
     f = f * 2.0 - 1.0
@@ -424,21 +625,29 @@ def periode_cretes(cretes, defaut=PERIODE_DEFAUT):
     # d'avant lui attribuait une période trop grande — toutes les tolérances
     # partaient alors du double de la bonne valeur.
     ondes = np.arange(4, 41, dtype=np.float32)
-    energie = np.zeros_like(ondes)
-    for i, onde in enumerate(ondes):
-        anneau = (rayon > 1.0 / (onde + 0.5)) & (rayon <= 1.0 / (onde - 0.5))
-        # UN ANNEAU TROP MINCE NE MESURE PLUS RIEN. Aux grandes longueurs
-        # d'onde l'anneau ne contient qu'une poignée de cases du spectre, et
-        # ces cases-là portent la FORME de l'empreinte (l'ovale du doigt), pas
-        # ses crêtes : leur moyenne écrase le vrai pic. Sur une empreinte
-        # petite ou fine — un bébé, précisément — l'interligne mesuré partait
-        # alors à 32 px au lieu de 11, et TOUTES les tolérances avec lui.
-        if int(anneau.sum()) >= ANNEAU_MINI:
-            energie[i] = float(spectre[anneau].mean())
+    # UN ANNEAU TROP MINCE NE MESURE PLUS RIEN (ANNEAU_MINI cases au moins).
+    # Aux grandes longueurs d'onde l'anneau ne contient qu'une poignée de
+    # cases du spectre, et ces cases-là portent la FORME de l'empreinte
+    # (l'ovale du doigt), pas ses crêtes : leur moyenne écrase le vrai pic.
+    # Sur une empreinte petite ou fine — un bébé, précisément — l'interligne
+    # mesuré partait alors à 32 px au lieu de 11, et TOUTES les tolérances
+    # avec lui.
+    energie = _energie_anneaux(spectre, rayon, ondes, ANNEAU_MINI)
     if not energie.any():
         return defaut
     energie = cv2.GaussianBlur(energie.reshape(-1, 1), (1, 5), 0).ravel()
     return float(np.clip(ondes[int(np.argmax(energie))], 4.0, 34.0))
+
+
+def _flou_gaussien():
+    """cv2.GaussianBlur(image, (0, 0), sigma), en version « bandes en
+    parallèle » de completer_empreinte quand elle est là (même résultat au
+    bit près, voir completer_empreinte.flou_gaussien)."""
+    try:
+        from completer_empreinte import flou_gaussien
+        return flou_gaussien
+    except Exception:
+        return lambda image, sigma: cv2.GaussianBlur(image, (0, 0), sigma)
 
 
 def champ_orientation(cretes, periode=None):
@@ -460,9 +669,10 @@ def champ_orientation(cretes, periode=None):
     bande = (255.0 - img.astype(np.float32)) / 255.0
     gx = cv2.Sobel(bande, cv2.CV_32F, 1, 0, ksize=3)
     gy = cv2.Sobel(bande, cv2.CV_32F, 0, 1, ksize=3)
-    jxx = cv2.GaussianBlur(gx * gx, (0, 0), sigma)
-    jyy = cv2.GaussianBlur(gy * gy, (0, 0), sigma)
-    jxy = cv2.GaussianBlur(gx * gy, (0, 0), sigma)
+    flou = _flou_gaussien()
+    jxx = flou(gx * gx, sigma)
+    jyy = flou(gy * gy, sigma)
+    jxy = flou(gx * gy, sigma)
     c2, s2 = jxx - jyy, 2.0 * jxy                 # angle double du gradient
     magnitude = np.sqrt(c2 * c2 + s2 * s2) + 1e-9
     coherence = (magnitude / (jxx + jyy + 1e-9)).astype(np.float32)
@@ -1580,17 +1790,22 @@ def clipper(lignes, masque):
     h, w = masque.shape
     resultat = []
     for l in lignes:
-        courant = []
-        for p in l:
-            x, y = int(round(p[0])), int(round(p[1]))
-            if 0 <= x < w and 0 <= y < h and masque[y, x] > 0:
-                courant.append(p)
-            else:
-                if len(courant) >= 2:
-                    resultat.append(np.array(courant))
-                courant = []
-        if len(courant) >= 2:
-            resultat.append(np.array(courant))
+        l = np.asarray(l)
+        if not len(l):
+            continue
+        # même arrondi que round() (au pair le plus proche), d'un coup
+        x = np.round(l[:, 0])
+        y = np.round(l[:, 1])
+        dedans = (x >= 0) & (x < w) & (y >= 0) & (y < h)
+        xi = np.where(dedans, x, 0).astype(np.int64)
+        yi = np.where(dedans, y, 0).astype(np.int64)
+        dedans &= masque[yi, xi] > 0
+        # tronçons consécutifs de points gardés
+        bords = np.flatnonzero(np.diff(np.concatenate(
+            [[0], dedans.astype(np.int8), [0]])))
+        for i0, i1 in zip(bords[::2], bords[1::2]):
+            if i1 - i0 >= 2:
+                resultat.append(l[i0:i1].copy())
     return resultat
 
 
@@ -1857,16 +2072,18 @@ def chemin_bezier(points):
     if n == 2:
         return (f"M {p[0][0]:.1f} {p[0][1]:.1f} "
                 f"L {p[1][0]:.1f} {p[1][1]:.1f}")
-    morceaux = [f"M {p[0][0]:.1f} {p[0][1]:.1f}"]
-    for i in range(n - 1):
-        p0 = p[i - 1] if i > 0 else p[i]
-        p1, p2 = p[i], p[i + 1]
-        p3 = p[i + 2] if i + 2 < n else p2
-        c1 = p1 + (p2 - p0) / 6.0
-        c2 = p2 - (p3 - p1) / 6.0
-        morceaux.append(f"C {c1[0]:.1f} {c1[1]:.1f} "
-                        f"{c2[0]:.1f} {c2[1]:.1f} {p2[0]:.1f} {p2[1]:.1f}")
-    return " ".join(morceaux)
+    # tous les points de contrôle d'un coup (mêmes opérations, point par
+    # point, que la boucle d'origine), puis un seul formatage « %.1f » —
+    # le texte produit est le même, caractère pour caractère
+    p = np.asarray(p)
+    p0 = np.concatenate([p[:1], p[:-2]])          # p[i-1] (p[0] au départ)
+    p1, p2 = p[:-1], p[1:]
+    p3 = np.concatenate([p[2:], p[-1:]])          # p[i+2] (p[n-1] au bout)
+    c1 = p1 + (p2 - p0) / 6.0
+    c2 = p2 - (p3 - p1) / 6.0
+    valeurs = np.concatenate([c1, c2, p2], axis=1).ravel().tolist()
+    gabarit = "M %.1f %.1f" + " C %.1f %.1f %.1f %.1f %.1f %.1f" * (n - 1)
+    return gabarit % (float(p[0][0]), float(p[0][1]), *valeurs)
 
 
 def calculer_traits(cretes, masque_clip=None, contact=None):
@@ -1877,11 +2094,71 @@ def calculer_traits(cretes, masque_clip=None, contact=None):
               None = valeur par défaut AUTORISER_CONTACT.
     Toutes les tolérances sont calées sur l'interligne des crêtes mesuré sur
     l'image : le tracé s'adapte à la taille de l'empreinte, et aucun trait
-    final ne fait moins de 2 interlignes — un trait de crête est long."""
+    final ne fait moins de 2 interlignes — un trait de crête est long.
+
+    MÉMOIRE : une carte de crêtes déjà tracée (même contenu, même masque, même
+    mode) ressort de la mémoire, sans rien recalculer — c'est le cas du
+    « gabor plein », qui dessine les mêmes traits que le mode « contact », et
+    de tout aller-retour de forme ou de style dans l'app. Les deux modes
+    partagent en outre toute la première moitié du calcul (squelette,
+    pontages), gardée elle aussi. On rend toujours des COPIES."""
     if contact is None:
         contact = AUTORISER_CONTACT
-    from skimage.morphology import skeletonize
+    cle = None
+    if CACHE_ACTIF:
+        cle = _cle_contenu("traits", cretes, masque_clip, bool(contact))
+        deja = _lire_memoire(_MEMOIRE_TRAITS, cle)
+        if deja is not None:
+            return [l.copy() for l in deja]
+    preparation = None
+    cle_prep = None
+    if CACHE_ACTIF:
+        cle_prep = _cle_contenu("preparation", cretes)
+        preparation = _lire_memoire(_MEMOIRE_PREPARATION, cle_prep)
+    if preparation is None:
+        preparation = _preparer_traits(cretes)
+        if cle_prep is not None:
+            periode, champ, coupures, morceaux = preparation
+            _ranger_memoire(_MEMOIRE_PREPARATION, cle_prep,
+                            (periode, list(coupures),
+                             [m.copy() for m in morceaux]),
+                            MEMOIRE_PREPARATION_MAX)
+    else:
+        # le champ d'orientation (lourd en mémoire) n'est pas gardé : on le
+        # recalcule, à l'identique, à partir de la carte et de l'interligne
+        periode, coupures, morceaux = preparation
+        preparation = (periode, champ_orientation(cretes, periode),
+                       list(coupures), [m.copy() for m in morceaux])
+    finales = _finir_traits(cretes, masque_clip, contact, *preparation)
+    if cle is not None:
+        _ranger_memoire(_MEMOIRE_TRAITS, cle, [l.copy() for l in finales],
+                        MEMOIRE_TRAITS_MAX)
+    return finales
 
+
+def _squelette(masque):
+    """Squelette des crêtes (skimage, algorithme de Zhang-Suen), calculé sur
+    la seule boîte qui contient des crêtes (+ 2 px de vide) : l'amincissement
+    ne regarde que les 3 x 3 voisins de chaque pixel et traite toute l'image
+    d'un coup à chaque passe, le résultat est donc exactement celui de la
+    toile entière — sans parcourir les grands blancs d'un cœur ou d'un trèfle."""
+    from skimage.morphology import skeletonize
+    lignes = np.flatnonzero(masque.any(axis=1))
+    colonnes = np.flatnonzero(masque.any(axis=0))
+    if not len(lignes):
+        return skeletonize(masque)
+    h, w = masque.shape
+    y0, y1 = max(0, int(lignes[0]) - 2), min(h, int(lignes[-1]) + 3)
+    x0, x1 = max(0, int(colonnes[0]) - 2), min(w, int(colonnes[-1]) + 3)
+    sortie = np.zeros(masque.shape, bool)
+    sortie[y0:y1, x0:x1] = skeletonize(np.ascontiguousarray(masque[y0:y1, x0:x1]))
+    return sortie
+
+
+def _preparer_traits(cretes):
+    """Première moitié de calculer_traits, commune aux deux modes (avec ou
+    sans contact) : squelette, traversée des carrefours, pontages, rattrapage
+    des micro-traits. Retourne (periode, champ, coupures, morceaux)."""
     periode = periode_cretes(cretes)              # interligne mesuré (px)
     # TOUTES les tolérances se déduisent de cet interligne : le tracé d'une
     # empreinte de bébé est celui d'un adulte, à l'échelle près.
@@ -1889,13 +2166,12 @@ def calculer_traits(cretes, masque_clip=None, contact=None):
                  PORTEE_TANGENTE * periode)
     seuil = max(LONGUEUR_PLANCHER, LONGUEUR_MINI_PERIODES * periode)
     pas = pas_pour(periode)                       # espacement des points
-    ecart = ecart_mini_pour(periode)              # « sans contact » garanti
     portee_pont = max(PONT_PLANCHER, PONT_PORTEE * periode)
     courbure = COURBURE_RAYON / max(periode, 1.0)  # °/px (voir COURBURE_RAYON)
     champ = champ_orientation(cretes, periode)    # l'arbitre du pontage
     coupures = []                                 # coutures repérées (partagées)
 
-    squelette = skeletonize(cretes < 128)
+    squelette = _squelette(np.asarray(cretes) < 128)
     squelette = ebarber(squelette, BARBE_MAXI * periode)   # plus de barbes
 
     # 1. une crête traverse ses carrefours d'un seul trait
@@ -1942,6 +2218,17 @@ def calculer_traits(cretes, masque_clip=None, contact=None):
                                champ=champ, periode=periode,
                                coupures=coupures, pas=pas)
     morceaux = absorber_doublons(morceaux, DOUBLON_ECART * periode, seuil)
+    return periode, champ, coupures, morceaux
+
+
+def _finir_traits(cretes, masque_clip, contact, periode, champ, coupures,
+                  morceaux):
+    """Seconde moitié de calculer_traits : ce qui dépend du mode (contact ou
+    non) et du masque de découpe."""
+    seuil = max(LONGUEUR_PLANCHER, LONGUEUR_MINI_PERIODES * periode)
+    pas = pas_pour(periode)                       # espacement des points
+    ecart = ecart_mini_pour(periode)              # « sans contact » garanti
+    courbure = COURBURE_RAYON / max(periode, 1.0)  # °/px (voir COURBURE_RAYON)
 
     finales = []
     rognage = float(np.clip(ROGNAGE_PERIODES * periode,

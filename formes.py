@@ -21,6 +21,7 @@ Utilisation autonome (test) :
 
 import os
 import sys
+from collections import OrderedDict
 
 import cv2
 import numpy as np
@@ -34,6 +35,73 @@ ESPACE = 22               # épaisseur du fin espace entre deux lobes (px)
 RAYON_LOBE = 430          # rayon de référence d'un lobe (px)
 MARGE = 60                # marge blanche autour de la forme (px)
 INCLINAISON_COEUR = 20    # les 2 empreintes du cœur penchent (en miroir), en °
+
+# Mémoire des cartes de crêtes déjà calculées (la complétion est l'étape la
+# plus longue du rendu). Clé = CONTENU exact de l'empreinte posée dans son
+# lobe + masque du lobe + réglages : passer d'un style à l'autre, revenir à
+# une forme déjà vue ou retoucher une seule empreinte d'une commande ne
+# recalcule que ce qui a vraiment changé. Le résultat est le même qu'en
+# recalculant. Les tracés eux-mêmes sont gardés par tracer_svg.
+MEMOIRE_CRETES_MAX = 16   # ~1 à 3 Mo par carte
+_MEMOIRE_CRETES = OrderedDict()
+
+
+def _prechauffer():
+    """Charge en arrière-plan les modules lourds du tracé (skimage, scipy :
+    ~0,5 s) pendant que l'app s'ouvre et qu'on scanne, pour que le premier
+    aperçu ne les attende pas. Sans effet sur le résultat."""
+    try:
+        import skimage.morphology  # noqa: F401
+        import scipy.spatial  # noqa: F401
+    except Exception:
+        pass
+
+
+try:
+    import threading as _threading
+    _threading.Thread(target=_prechauffer, name="prechauffage",
+                      daemon=True).start()
+except Exception:
+    pass
+
+
+def vider_cache():
+    """Oublie toutes les cartes de crêtes et tous les tracés gardés."""
+    with tracer_svg._VERROU_MEMOIRE:
+        _MEMOIRE_CRETES.clear()
+        _MEMOIRE_MASQUES.clear()
+    tracer_svg.vider_cache()
+
+
+_ATELIER_TRACES = None
+
+
+def _atelier_traces():
+    """Un fil de calcul pour tracer une empreinte pendant que la suivante se
+    complète (voir composer)."""
+    global _ATELIER_TRACES
+    if _ATELIER_TRACES is None:
+        from concurrent.futures import ThreadPoolExecutor
+        _ATELIER_TRACES = ThreadPoolExecutor(max_workers=1,
+                                             thread_name_prefix="trace")
+    return _ATELIER_TRACES
+
+
+class _Fait:
+    """Tâche exécutée sur-le-champ, présentée comme une tâche en attente
+    (même .result() qu'un Future : l'erreur éventuelle ressort à la lecture,
+    dans l'ordre des lobes)."""
+
+    def __init__(self, fonction, *arguments):
+        try:
+            self._resultat, self._erreur = fonction(*arguments), None
+        except Exception as erreur:
+            self._resultat, self._erreur = None, erreur
+
+    def result(self):
+        if self._erreur is not None:
+            raise self._erreur
+        return self._resultat
 
 # Ajustement fin d'une empreinte dans son lobe (voir appliquer_ajust).
 AJUST_NEUTRE = {"dx": 0.0, "dy": 0.0, "angle": 0.0}
@@ -155,14 +223,29 @@ def forme_trefle(n, rayon=RAYON_LOBE, espace=ESPACE):
     return h, w, contour, lobes, [(o, 0.0) for o in orbites]
 
 
+_MEMOIRE_MASQUES = OrderedDict()
+
+
 def masques(forme, n):
-    """Aiguilleur : renvoie (h, w, contour, [lobes], [rotations])."""
+    """Aiguilleur : renvoie (h, w, contour, [lobes], [rotations]).
+    Les masques ne dépendent que de la forme, du nombre d'empreintes et des
+    réglages ci-dessus : on les garde (le trèfle demande ~0,1 s à dessiner)
+    et on rend des copies."""
     forme = nom_forme(forme)
-    if forme == "coeur":
-        return forme_coeur()
-    if forme == "trefle":
-        return forme_trefle(n)
-    return forme_ovale(n)                          # "simple"
+    cle = (forme, int(n) if forme != "coeur" else 0,
+           tracer_svg._reglages_du_module(globals()))
+    deja = tracer_svg._lire_memoire(_MEMOIRE_MASQUES, cle)
+    if deja is None or not tracer_svg.CACHE_ACTIF:
+        if forme == "coeur":
+            deja = forme_coeur()
+        elif forme == "trefle":
+            deja = forme_trefle(n)
+        else:
+            deja = forme_ovale(n)                  # "simple"
+        if tracer_svg.CACHE_ACTIF:
+            tracer_svg._ranger_memoire(_MEMOIRE_MASQUES, cle, deja, 4)
+    h, w, contour, lobes, transforms = deja
+    return h, w, contour.copy(), [l.copy() for l in lobes], list(transforms)
 
 
 # --------------------------------------------------------------------------
@@ -319,6 +402,28 @@ def _cretes_brutes(toile, lobe_net):
     return sortie
 
 
+def _cretes_du_lobe(toile, lobe_net, completer):
+    """Carte de crêtes d'une empreinte posée dans son lobe : complétée
+    (completer=True) ou brute (Gabor seul). Gardée en mémoire, voir
+    MEMOIRE_CRETES_MAX. On rend toujours une COPIE."""
+    calcul = (lambda: completer_empreinte.completer(toile, domaine_force=lobe_net)) \
+        if completer else (lambda: _cretes_brutes(toile, lobe_net))
+    if not tracer_svg.CACHE_ACTIF:
+        return calcul()
+    import ameliorer_empreinte
+    reglages = (tracer_svg._reglages_du_module(vars(completer_empreinte))
+                + (tracer_svg._reglages_du_module(vars(ameliorer_empreinte))
+                   if not completer else ""))
+    cle = tracer_svg._cle_contenu("cretes", toile, lobe_net, bool(completer),
+                                  reglages=reglages)
+    deja = tracer_svg._lire_memoire(_MEMOIRE_CRETES, cle)
+    if deja is None:
+        deja = calcul()
+        tracer_svg._ranger_memoire(_MEMOIRE_CRETES, cle, deja.copy(),
+                                   MEMOIRE_CRETES_MAX)
+    return deja.copy()
+
+
 def _periode_cretes(cretes):
     """Espacement moyen des crêtes (interligne), en px.
 
@@ -369,39 +474,61 @@ def composer(mosaiques, forme, style, chemin_svg, apercu_png=None,
                                chemin_svg, apercu_png, ajusts)
 
     noyau = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    traits, largeurs = [], []
-    for i, (mosaique, lobe, (orbite, sur_soi)) in enumerate(
-            zip(mosaiques, lobes, transforms)):
-        crop = crops[i] if crops else None
-        completer = completions[i] if completions else True
-        mos = tourner_sur_elle_meme(_recadrer_mosaique(mosaique, crop), sur_soi)
-        if orbite == 0:
-            toile = poser_dans_lobe(mos, lobe)             # posée directement
-        else:
-            # posée à l'endroit dans le 1er lobe, puis toute la toile tourne
-            # autour du centre pour l'amener (orientée) dans ce lobe-ci
-            toile = poser_dans_lobe(mos, lobes[0])
-            toile = tourner_autour_du_centre(toile, orbite)
-        # retouche fine demandée par l'utilisateur (glisser / tourner)
-        toile = appliquer_ajust(toile, lobe, ajusts[i] if ajusts else None)
-        lobe_net = cv2.erode(lobe, noyau)          # bord franc
-        if completer:
-            cretes = completer_empreinte.completer(toile, domaine_force=lobe_net)
-        else:
-            cretes = _cretes_brutes(toile, lobe_net)
-        if apercu_png is not None:                 # trace pour le diagnostic
-            base = os.path.splitext(apercu_png)[0]
-            cv2.imwrite(f"{base}_debug{i}_source.png", toile)
-            cv2.imwrite(f"{base}_debug{i}_cretes.png", cretes)
+
+    def tracer_lobe(cretes, lobe_net):
         # tous les styles partent du squelette (crêtes bien séparées) ; le
         # "gabor plein" ne fait que les dessiner épais -> jamais de blob noir,
         # les vallées entre crêtes restent toujours visibles.
-        traits += tracer_svg.calculer_traits(
+        traits_lobe = tracer_svg.calculer_traits(
             cretes, masque_clip=lobe_net, contact=(style != "sans"))
         # l'épaisseur suit l'INTERLIGNE de CETTE empreinte (voir composer)
         periode = _periode_cretes(cretes)
-        largeurs.append(periode * 0.52 if style == "gabor"
-                        else tracer_svg.largeur_trait_pour(periode))
+        return traits_lobe, (periode * 0.52 if style == "gabor"
+                             else tracer_svg.largeur_trait_pour(periode))
+
+    # À la chaîne : pendant que l'empreinte i se trace (calcul Python, sur un
+    # fil à part), l'empreinte i+1 se complète (OpenCV / numpy, sur tous les
+    # cœurs). Les tracés sont repris DANS L'ORDRE des lobes : le dessin est
+    # exactement celui d'un calcul l'un après l'autre.
+    en_cours = []
+    nb_lobes = min(len(mosaiques), len(lobes), len(transforms))
+    try:
+        for i, (mosaique, lobe, (orbite, sur_soi)) in enumerate(
+                zip(mosaiques, lobes, transforms)):
+            crop = crops[i] if crops else None
+            completer = completions[i] if completions else True
+            mos = tourner_sur_elle_meme(_recadrer_mosaique(mosaique, crop),
+                                        sur_soi)
+            if orbite == 0:
+                toile = poser_dans_lobe(mos, lobe)         # posée directement
+            else:
+                # posée à l'endroit dans le 1er lobe, puis toute la toile
+                # tourne autour du centre pour l'amener (orientée) dans ce
+                # lobe-ci
+                toile = poser_dans_lobe(mos, lobes[0])
+                toile = tourner_autour_du_centre(toile, orbite)
+            # retouche fine demandée par l'utilisateur (glisser / tourner)
+            toile = appliquer_ajust(toile, lobe, ajusts[i] if ajusts else None)
+            lobe_net = cv2.erode(lobe, noyau)      # bord franc
+            cretes = _cretes_du_lobe(toile, lobe_net, completer)  # (mémorisé)
+            if apercu_png is not None:             # trace pour le diagnostic
+                base = os.path.splitext(apercu_png)[0]
+                cv2.imwrite(f"{base}_debug{i}_source.png", toile)
+                cv2.imwrite(f"{base}_debug{i}_cretes.png", cretes)
+            if i == nb_lobes - 1:                  # le dernier : tout de suite
+                en_cours.append(_Fait(tracer_lobe, cretes, lobe_net))
+            else:
+                en_cours.append(_atelier_traces().submit(tracer_lobe, cretes,
+                                                         lobe_net))
+    except BaseException:
+        for tache in en_cours:                     # une erreur de tracé d'un
+            tache.result()                         # lobe d'avant passe d'abord
+        raise
+    traits, largeurs = [], []
+    for tache in en_cours:
+        traits_lobe, largeur_lobe = tache.result()
+        traits += traits_lobe
+        largeurs.append(largeur_lobe)
 
     if largeur_trait is not None:                  # épaisseur imposée
         largeur = float(largeur_trait)
