@@ -74,8 +74,8 @@ enum LogoMMDGeometrie {
     }
 }
 
-/// Le logo complet. `tourne` fait tourner l'anneau de texte autour du centre
-/// immobile : c'est l'indicateur de chargement de la maison.
+/// Le logo complet. `tourne` fait tourner tout le badge sur lui-même
+/// (drapeau compris) : c'est l'indicateur de chargement de la maison.
 struct LogoMMDVectoriel: View {
     var encre: Color = Color(red: 0.07, green: 0.07, blue: 0.08)
     var tourne: Bool = false
@@ -86,18 +86,19 @@ struct LogoMMDVectoriel: View {
     var body: some View {
         GeometryReader { geo in
             let cote = min(geo.size.width, geo.size.height)
-            ZStack {
+            Group {
                 if tourne {
+                    // tout le badge tourne d'un bloc : texte, anneaux, points
+                    // ET drapeau, comme une médaille qu'on fait pivoter
                     TimelineView(.animation) { ctx in
                         let t = ctx.date.timeIntervalSinceReferenceDate
-                        anneau(cote)
+                        badge(cote)
                             .rotationEffect(.degrees((t * vitesse * 360)
                                 .truncatingRemainder(dividingBy: 360)))
                     }
                 } else {
-                    anneau(cote)
+                    badge(cote)
                 }
-                centre(cote)
             }
             .frame(width: cote, height: cote)
             .position(x: geo.size.width / 2, y: geo.size.height / 2)
@@ -108,7 +109,15 @@ struct LogoMMDVectoriel: View {
 
     private typealias G = LogoMMDGeometrie
 
-    /// Grand anneau + texte (la partie qui tourne).
+    /// Le badge entier, dans un carré de `cote`.
+    private func badge(_ cote: CGFloat) -> some View {
+        ZStack {
+            anneau(cote)
+            centre(cote)
+        }
+    }
+
+    /// Grand anneau + texte.
     private func anneau(_ cote: CGFloat) -> some View {
         Canvas { ctx, taille in
             let k = taille.width / 2 / (G.rayonBord + 1)
@@ -124,7 +133,7 @@ struct LogoMMDVectoriel: View {
         .frame(width: cote, height: cote)
     }
 
-    /// Petit anneau, points de suspension et drapeau (immobiles).
+    /// Petit anneau, points de suspension et drapeau.
     private func centre(_ cote: CGFloat) -> some View {
         Canvas { ctx, taille in
             let k = taille.width / 2 / (G.rayonBord + 1)
