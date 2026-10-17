@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
 formes.py — assemble plusieurs empreintes dans une forme (ovale simple,
-cœur, trèfle) pour la gravure. Chaque empreinte remplit son « lobe » ;
-un fin espace sépare les lobes pour qu'ils ne se touchent pas.
+cœur, trèfle, ovale coupé, tête-bêche) pour la gravure. Chaque empreinte
+remplit son « lobe » ; un fin espace sépare les lobes pour qu'ils ne se
+touchent pas.
 
 Trois styles de rendu, tous exportés en SVG :
   - "gabor"   : crêtes pleines vectorisées (lissées, plus de pixels) ;
@@ -10,9 +11,21 @@ Trois styles de rendu, tous exportés en SVG :
   - "contact" : traits fins avec bifurcations soudées (comme le Gabor).
 
 Formes selon le nombre d'empreintes :
-  - "simple" : n ovales côte à côte ;
-  - "coeur"  : 2 moitiés (2 empreintes) ;
-  - "trefle" : 3 ou 4 lobes en trèfle.
+  - "simple"     : n ovales côte à côte ;
+  - "coeur"      : 2 moitiés (2 empreintes) ;
+  - "trefle"     : 3 ou 4 lobes en trèfle ;
+  - "ovale_lr"   : « Ovale coupé » — UN ovale (celui d'une empreinte seule)
+                   coupé verticalement par un fin espace : empreinte 1 à
+                   gauche, empreinte 2 à droite (exactement 2 empreintes) ;
+  - "tete_beche" : « Tête-bêche » — le même ovale coupé horizontalement :
+                   empreinte 1 droite en haut, empreinte 2 tournée de 180°
+                   en bas (exactement 2 empreintes) ;
+  - "separees"   : pas de composition, chaque empreinte est rendue SEULE
+                   (rendre_seule) ; planche() les pose côte à côte pour
+                   l'aperçu.
+Pour l'ovale coupé et le tête-bêche, chaque empreinte est mise à l'échelle
+comme si elle remplissait TOUT l'ovale (même échelle qu'une empreinte
+seule), centrée sur le centre de l'ovale, puis découpée par sa moitié.
 
 Utilisation autonome (test) :
     python3 formes.py coeur contact sortie.svg a.png b.png
@@ -109,7 +122,19 @@ AJUST_NEUTRE = {"dx": 0.0, "dy": 0.0, "angle": 0.0}
 # L'app peut nommer les formes/styles autrement (« trefle3 », « traits »…) :
 # on accepte ces synonymes pour ne rien casser des deux côtés.
 ALIAS_FORMES = {"trefle3": "trefle", "trefle4": "trefle", "trèfle": "trefle",
-                "cœur": "coeur", "ovale": "simple"}
+                "cœur": "coeur", "ovale": "simple",
+                "ovale_coupe": "ovale_lr", "ovale-lr": "ovale_lr",
+                "tete-beche": "tete_beche", "tête-bêche": "tete_beche",
+                "tête_bêche": "tete_beche", "tetebeche": "tete_beche",
+                "separee": "separees", "séparées": "separees",
+                "separe": "separees"}
+# Libellés de l'app (messages d'erreur, noms de fichiers exportés).
+LIBELLES_FORMES = {"simple": "Simple", "separees": "Séparées", "coeur": "Cœur",
+                   "trefle": "Trèfle", "ovale_lr": "Ovale coupé",
+                   "tete_beche": "Tête-bêche"}
+# Formes à nombre d'empreintes imposé (les autres : voir l'app).
+NOMBRE_EXACT = {"ovale_lr": 2, "tete_beche": 2}
+FORMES_COUPEES = ("ovale_lr", "tete_beche")
 ALIAS_STYLES = {"traits": "contact", "traits_soudes": "contact",
                 "soude": "contact", "traits_fins": "sans", "fins": "sans",
                 "plein": "gabor"}
@@ -125,6 +150,17 @@ def nom_style(style):
     """Nom canonique d'un style (« traits » -> « contact »)."""
     style = (style or "contact").strip().lower()
     return ALIAS_STYLES.get(style, style)
+
+
+def erreur_nombre(forme, n):
+    """Message d'erreur si la forme n'accepte pas n empreintes, sinon None.
+    (« La forme « Ovale coupé » demande exactement 2 empreintes. »)"""
+    forme = nom_forme(forme)
+    attendu = NOMBRE_EXACT.get(forme)
+    if attendu is not None and n != attendu:
+        return (f"La forme « {LIBELLES_FORMES.get(forme, forme)} » demande "
+                f"exactement {attendu} empreintes.")
+    return None
 
 
 # --------------------------------------------------------------------------
@@ -223,28 +259,77 @@ def forme_trefle(n, rayon=RAYON_LOBE, espace=ESPACE):
     return h, w, contour, lobes, [(o, 0.0) for o in orbites]
 
 
+def forme_ovale_coupe(sens, rayon=RAYON_LOBE, espace=ESPACE):
+    """UN ovale — exactement celui d'une empreinte seule (forme_ovale(1)) —
+    coupé en deux par un fin espace vide de `espace` px, comme le milieu du
+    cœur (rien n'y est gravé).
+      sens "vertical"   : « Ovale coupé » (ovale_lr), moitié GAUCHE pour
+                          l'empreinte 1, moitié DROITE pour l'empreinte 2 ;
+      sens "horizontal" : « Tête-bêche », moitié du HAUT pour l'empreinte 1
+                          (droite), moitié du BAS pour l'empreinte 2, tournée
+                          de 180° sur elle-même : on voit le haut de chacune.
+    Renvoie (h, w, ovale entier, [moitié 1, moitié 2], [(orbite, sur-soi)])."""
+    h, w, ovale, (plein,), _ = forme_ovale(1, rayon)
+    cx = MARGE + int(rayon * 0.82)               # centre de forme_ovale(1)
+    cy = h // 2
+    un, deux = plein.copy(), plein.copy()
+    if sens == "vertical":
+        un[:, cx - espace // 2:] = 0
+        deux[:, :cx + espace // 2] = 0
+        return h, w, ovale, [un, deux], [(0.0, 0.0), (0.0, 0.0)]
+    un[cy - espace // 2:, :] = 0
+    deux[:cy + espace // 2, :] = 0
+    return h, w, ovale, [un, deux], [(0.0, 0.0), (0.0, 180.0)]
+
+
 _MEMOIRE_MASQUES = OrderedDict()
 
 
-def masques(forme, n):
-    """Aiguilleur : renvoie (h, w, contour, [lobes], [rotations]).
-    Les masques ne dépendent que de la forme, du nombre d'empreintes et des
-    réglages ci-dessus : on les garde (le trèfle demande ~0,1 s à dessiner)
-    et on rend des copies."""
+def _geometrie(forme, n):
+    """Tout ce qu'il faut pour poser n empreintes dans la forme :
+    (h, w, contour, [lobes], [(orbite, sur-soi)], [cadres], [centres]).
+      cadres[i]  : masque sur lequel l'empreinte i est mise à l'échelle et
+                   centrée — None = son propre lobe (cœur, trèfle, simple :
+                   comme toujours) ; l'ovale ENTIER pour les formes coupées ;
+      centres[i] : centre de rotation de son `ajust` — None = centre de son
+                   lobe (comme toujours) ; centre de l'ovale pour les formes
+                   coupées (l'empreinte y est centrée).
+    Ne dépend que de la forme, du nombre d'empreintes et des réglages : gardé
+    en mémoire (le trèfle demande ~0,1 s à dessiner). Ne pas modifier les
+    tableaux rendus (masques() en donne des copies)."""
     forme = nom_forme(forme)
-    cle = (forme, int(n) if forme != "coeur" else 0,
+    cle = (forme, int(n) if forme not in ("coeur",) + FORMES_COUPEES else 0,
            tracer_svg._reglages_du_module(globals()))
     deja = tracer_svg._lire_memoire(_MEMOIRE_MASQUES, cle)
     if deja is None or not tracer_svg.CACHE_ACTIF:
         if forme == "coeur":
-            deja = forme_coeur()
+            base = forme_coeur()
         elif forme == "trefle":
-            deja = forme_trefle(n)
+            base = forme_trefle(n)
+        elif forme == "ovale_lr":
+            base = forme_ovale_coupe("vertical")
+        elif forme == "tete_beche":
+            base = forme_ovale_coupe("horizontal")
         else:
-            deja = forme_ovale(n)                  # "simple"
+            base = forme_ovale(n)                  # "simple" (et "separees")
+        h, w, contour, lobes, transforms = base
+        if forme in FORMES_COUPEES:
+            centre = centre_lobe(contour)
+            cadres = [contour] * len(lobes)
+            centres = [centre] * len(lobes)
+        else:
+            cadres = [None] * len(lobes)
+            centres = [None] * len(lobes)
+        deja = (h, w, contour, lobes, transforms, cadres, centres)
         if tracer_svg.CACHE_ACTIF:
             tracer_svg._ranger_memoire(_MEMOIRE_MASQUES, cle, deja, 4)
-    h, w, contour, lobes, transforms = deja
+    return deja
+
+
+def masques(forme, n):
+    """Aiguilleur : renvoie (h, w, contour, [lobes], [rotations]) — des
+    copies (voir _geometrie)."""
+    h, w, contour, lobes, transforms = _geometrie(forme, n)[:5]
     return h, w, contour.copy(), [l.copy() for l in lobes], list(transforms)
 
 
@@ -258,9 +343,13 @@ def _bbox(masque):
 
 
 def tourner_sur_elle_meme(mosaique, degres):
-    """Tourne l'empreinte sur elle-même (toile agrandie, fond blanc)."""
+    """Tourne l'empreinte sur elle-même (toile agrandie, fond blanc).
+    Un demi-tour (tête-bêche) est fait EXACTEMENT (retournement des pixels,
+    sans interpolation)."""
     if abs(degres) < 0.5:
         return mosaique
+    if abs((float(degres) % 360.0) - 180.0) < 1e-9:
+        return np.ascontiguousarray(mosaique[::-1, ::-1])
     h, w = mosaique.shape
     M = cv2.getRotationMatrix2D((w / 2, h / 2), degres, 1.0)
     cos, sin = abs(M[0, 0]), abs(M[0, 1])
@@ -289,7 +378,7 @@ def centre_lobe(lobe):
     return (lx0 + lx1) / 2.0, (ly0 + ly1) / 2.0
 
 
-def appliquer_ajust(toile, lobe, ajust, rayon=RAYON_LOBE):
+def appliquer_ajust(toile, lobe, ajust, rayon=RAYON_LOBE, centre=None):
     """Retouche fine de l'empreinte DANS son lobe, telle que l'utilisateur la
     ressent en faisant glisser l'empreinte dans l'aperçu.
 
@@ -307,6 +396,9 @@ def appliquer_ajust(toile, lobe, ajust, rayon=RAYON_LOBE):
     Le lobe, lui, ne bouge pas : le découpage final se fait toujours sur le
     lobe d'origine, donc l'empreinte « glisse » derrière sa fenêtre.
     Les zones découvertes restent blanches (la complétion les remplira).
+    `centre` : centre de la rotation (défaut : centre du lobe). Les formes
+    coupées tournent l'empreinte autour du centre de l'ovale, où elle est
+    posée.
     """
     if not ajust:
         return toile
@@ -316,7 +408,7 @@ def appliquer_ajust(toile, lobe, ajust, rayon=RAYON_LOBE):
     if abs(dx) < 1e-4 and abs(dy) < 1e-4 and abs(angle) < 1e-3:
         return toile
     h, w = toile.shape
-    cx, cy = centre_lobe(lobe)
+    cx, cy = centre_lobe(lobe) if centre is None else centre
     # OpenCV tourne dans le sens ANTI-horaire pour un angle positif : on
     # inverse le signe pour que angle > 0 = horaire, comme à l'écran.
     M = cv2.getRotationMatrix2D((cx, cy), -angle, 1.0)
@@ -463,19 +555,28 @@ def composer(mosaiques, forme, style, chemin_svg, apercu_png=None,
              gravure. Le trait garde donc la même part de l'interligne à
              toutes les tailles (et le « gabor plein », déjà calé sur la
              période, reste cohérent avec lui).
-    style : "gabor" | "sans" | "contact" | "photo". Renvoie (chemin, nb)."""
+    style : "gabor" | "sans" | "contact" | "photo". Renvoie (chemin, nb).
+    forme : voir l'en-tête du module ; "separees" se compose ici comme
+             "simple" (ovales côte à côte) — pour des empreintes vraiment
+             SEULES, voir rendre_seule / planche.
+    Lève ValueError (message prêt à afficher) si la forme exige un autre
+    nombre d'empreintes (ovale coupé, tête-bêche : 2)."""
     forme, style = nom_forme(forme), nom_style(style)
     n = len(mosaiques)
-    h, w, contour, lobes, transforms = masques(forme, n)
+    probleme = erreur_nombre(forme, n)
+    if probleme:
+        raise ValueError(probleme)
+    geometrie = _geometrie(forme, n)
+    h, w, contour, lobes, transforms = geometrie[:5]
 
     # style "photo" : on montre la vraie photo (mosaïque) découpée, pas un tracé
     if style == "photo":
-        return _composer_photo(mosaiques, lobes, transforms, crops, h, w,
-                               chemin_svg, apercu_png, ajusts)
+        return _composer_photo(mosaiques, geometrie, crops, chemin_svg,
+                               apercu_png, ajusts)
 
     noyau = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
 
-    def tracer_lobe(cretes, lobe_net):
+    def tracer_lobe(cretes, lobe_net, i):
         # tous les styles partent du squelette (crêtes bien séparées) ; le
         # "gabor plein" ne fait que les dessiner épais -> jamais de blob noir,
         # les vallées entre crêtes restent toujours visibles.
@@ -483,6 +584,9 @@ def composer(mosaiques, forme, style, chemin_svg, apercu_png=None,
             cretes, masque_clip=lobe_net, contact=(style != "sans"))
         # l'épaisseur suit l'INTERLIGNE de CETTE empreinte (voir composer)
         periode = _periode_cretes(cretes)
+        if forme in FORMES_COUPEES:                # coupure nette, sans miettes
+            traits_lobe = _degager_coupure(traits_lobe, lobe_net, forme, i,
+                                           periode)
         return traits_lobe, (periode * 0.52 if style == "gabor"
                              else tracer_svg.largeur_trait_pour(periode))
 
@@ -493,22 +597,12 @@ def composer(mosaiques, forme, style, chemin_svg, apercu_png=None,
     en_cours = []
     nb_lobes = min(len(mosaiques), len(lobes), len(transforms))
     try:
-        for i, (mosaique, lobe, (orbite, sur_soi)) in enumerate(
-                zip(mosaiques, lobes, transforms)):
+        for i, (mosaique, lobe) in enumerate(zip(mosaiques[:nb_lobes],
+                                                 lobes)):
             crop = crops[i] if crops else None
             completer = completions[i] if completions else True
-            mos = tourner_sur_elle_meme(_recadrer_mosaique(mosaique, crop),
-                                        sur_soi)
-            if orbite == 0:
-                toile = poser_dans_lobe(mos, lobe)         # posée directement
-            else:
-                # posée à l'endroit dans le 1er lobe, puis toute la toile
-                # tourne autour du centre pour l'amener (orientée) dans ce
-                # lobe-ci
-                toile = poser_dans_lobe(mos, lobes[0])
-                toile = tourner_autour_du_centre(toile, orbite)
-            # retouche fine demandée par l'utilisateur (glisser / tourner)
-            toile = appliquer_ajust(toile, lobe, ajusts[i] if ajusts else None)
+            toile = _poser(mosaique, i, geometrie, crop,
+                           ajusts[i] if ajusts else None)
             lobe_net = cv2.erode(lobe, noyau)      # bord franc
             cretes = _cretes_du_lobe(toile, lobe_net, completer)  # (mémorisé)
             if apercu_png is not None:             # trace pour le diagnostic
@@ -516,10 +610,10 @@ def composer(mosaiques, forme, style, chemin_svg, apercu_png=None,
                 cv2.imwrite(f"{base}_debug{i}_source.png", toile)
                 cv2.imwrite(f"{base}_debug{i}_cretes.png", cretes)
             if i == nb_lobes - 1:                  # le dernier : tout de suite
-                en_cours.append(_Fait(tracer_lobe, cretes, lobe_net))
+                en_cours.append(_Fait(tracer_lobe, cretes, lobe_net, i))
             else:
                 en_cours.append(_atelier_traces().submit(tracer_lobe, cretes,
-                                                         lobe_net))
+                                                         lobe_net, i))
     except BaseException:
         for tache in en_cours:                     # une erreur de tracé d'un
             tache.result()                         # lobe d'avant passe d'abord
@@ -546,22 +640,95 @@ def composer(mosaiques, forme, style, chemin_svg, apercu_png=None,
     return chemin_svg, len(traits)
 
 
-def _composer_photo(mosaiques, lobes, transforms, crops, h, w,
-                    chemin_svg, apercu_png, ajusts=None):
+COUPURE_BANDE = 0.35      # largeur (en interlignes) de la bande le long de la
+                          # coupure d'une forme coupée où un trait n'a pas le
+                          # droit de COURIR le long de la coupure
+COUPURE_PARALLELE = 35.0  # ...« le long » = à moins de ce nombre de degrés
+
+
+def _degager_coupure(traits, lobe_net, forme, i, periode):
+    """Formes coupées : la coupure doit rester un fin espace VIDE, bordé de
+    traits qui s'y arrêtent net. Le découpage au masque laisse parfois un
+    bout de crête qui court le long du bord (une crête presque parallèle à la
+    coupure, rognée sur sa longueur) : on dirait un trait gravé le long de la
+    coupure. On retire ces portions-là — points à moins de COUPURE_BANDE
+    interligne du bord ET orientés à moins de COUPURE_PARALLELE degrés de
+    lui —, puis les bouts devenus trop courts pour être des crêtes (même
+    seuil que tracer_svg : pas de miettes). Les crêtes qui TRAVERSENT la
+    coupure ne sont pas touchées : elles s'arrêtent net au bord."""
+    if not traits:
+        return traits
+    xs = np.flatnonzero(lobe_net.any(axis=0))
+    ys = np.flatnonzero(lobe_net.any(axis=1))
+    verticale = forme == "ovale_lr"             # ovale_lr : coupure verticale
+    if verticale:
+        bord, axe = (xs[-1] if i == 0 else xs[0]), 0
+    else:                                       # tête-bêche : horizontale
+        bord, axe = (ys[-1] if i == 0 else ys[0]), 1
+    bande = max(2.0, COUPURE_BANDE * float(periode))
+    seuil = max(tracer_svg.LONGUEUR_PLANCHER,
+                tracer_svg.LONGUEUR_MINI_PERIODES * float(periode))
+    sinus = np.sin(np.radians(COUPURE_PARALLELE))
+    sortie = []
+    for t in traits:
+        t = np.asarray(t, np.float64)
+        if len(t) < 2:
+            continue
+        pres = np.abs(t[:, axe] - bord) < bande
+        if not pres.any():
+            sortie.append(t)
+            continue
+        tangente = np.gradient(t, axis=0)
+        norme = np.linalg.norm(tangente, axis=1) + 1e-12
+        travers = np.abs(tangente[:, axe]) / norme  # composante à travers
+        retirer = pres & (travers < sinus)
+        if not retirer.any():
+            sortie.append(t)
+            continue
+        bords = np.flatnonzero(np.diff(np.concatenate(
+            [[0], (~retirer).astype(np.int8), [0]])))
+        for a, b in zip(bords[::2], bords[1::2]):
+            morceau = t[a:b]
+            if len(morceau) >= 2 and tracer_svg.longueur(morceau) >= seuil:
+                sortie.append(morceau)
+    return sortie
+
+
+def _poser(mosaique, i, geometrie, crop, ajust):
+    """L'empreinte i posée dans la forme : toile de la taille du canevas,
+    fond blanc, cadrage, rotation de forme et retouche (`ajust`) compris."""
+    h, w, contour, lobes, transforms, cadres, centres = geometrie
+    orbite, sur_soi = transforms[i]
+    lobe = lobes[i]
+    mos = tourner_sur_elle_meme(_recadrer_mosaique(mosaique, crop), sur_soi)
+    if cadres[i] is not None:
+        # formes coupées : à l'échelle de TOUT l'ovale, centrée sur lui ; sa
+        # moitié la découpera
+        toile = poser_dans_lobe(mos, cadres[i])
+    elif orbite == 0:
+        toile = poser_dans_lobe(mos, lobe)             # posée directement
+    else:
+        # posée à l'endroit dans le 1er lobe, puis toute la toile tourne
+        # autour du centre pour l'amener (orientée) dans ce lobe-ci
+        toile = poser_dans_lobe(mos, lobes[0])
+        toile = tourner_autour_du_centre(toile, orbite)
+    # retouche fine demandée par l'utilisateur (glisser / tourner)
+    return appliquer_ajust(toile, lobe, ajust, centre=centres[i])
+
+
+def _composer_photo(mosaiques, geometrie, crops, chemin_svg, apercu_png,
+                    ajusts=None):
     """Style « photo » : la vraie empreinte (niveaux de gris) découpée dans
     chaque lobe, sans tracé. SVG = image PNG embarquée (base64)."""
     import base64
+    h, w, contour, lobes = geometrie[:4]
     noyau = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     compo = np.full((h, w), 255, np.uint8)
-    for i, (mosaique, lobe, (orbite, sur_soi)) in enumerate(
-            zip(mosaiques, lobes, transforms)):
+    nb_lobes = min(len(mosaiques), len(lobes), len(geometrie[4]))
+    for i, (mosaique, lobe) in enumerate(zip(mosaiques[:nb_lobes], lobes)):
         crop = crops[i] if crops else None
-        mos = tourner_sur_elle_meme(_recadrer_mosaique(mosaique, crop), sur_soi)
-        if orbite == 0:
-            toile = poser_dans_lobe(mos, lobe)
-        else:
-            toile = tourner_autour_du_centre(poser_dans_lobe(mos, lobes[0]), orbite)
-        toile = appliquer_ajust(toile, lobe, ajusts[i] if ajusts else None)
+        toile = _poser(mosaique, i, geometrie, crop,
+                       ajusts[i] if ajusts else None)
         lobe_net = cv2.erode(lobe, noyau)
         affiche = fusionner_empreinte.normaliser_affichage(toile)
         compo[lobe_net > 0] = affiche[lobe_net > 0]
@@ -580,11 +747,140 @@ def _composer_photo(mosaiques, lobes, transforms, crops, h, w,
     return chemin_svg, 1
 
 
+# --------------------------------------------------------------------------
+# Empreintes séparées, et où se trouve chaque empreinte dans un rendu
+# --------------------------------------------------------------------------
+
+def rendre_seule(mosaique, style, chemin_svg, apercu_png=None, crop=None,
+                 completer=True):
+    """UNE empreinte seule dans un style : l'ovale d'une empreinte seule, son
+    cadrage et sa complétion, sans `ajust` (il ne règle que la place dans une
+    forme composée). C'est le rendu de la forme « separees » et de l'export."""
+    return composer([mosaique], "simple", style, chemin_svg,
+                    apercu_png=apercu_png, crops=[crop],
+                    completions=[completer])
+
+
+def _normaliser_angle(degres):
+    """Angle ramené dans ]-180, 180]."""
+    a = (float(degres) + 180.0) % 360.0 - 180.0
+    return 180.0 if a == -180.0 else a
+
+
+def _fractions(valeurs, diviseurs):
+    return [round(float(v) / float(d), 5) for v, d in zip(valeurs, diviseurs)]
+
+
+def disposition(forme, n, ajusts=None):
+    """Où est chaque empreinte dans l'image du rendu (PNG d'aperçu ou SVG),
+    en FRACTIONS de sa largeur (x) et de sa hauteur (y) :
+
+        {"largeur_forme": part de la largeur de l'image occupée par la forme
+                          gravée (pour « separees » : celle d'UNE médaille),
+         "lobes": [{"index", "cx", "cy", "rx", "ry", "angle", "zone"}]}
+
+    (cx, cy) : centre ACTUEL de l'empreinte i, `ajust` compris ; rx, ry :
+    demi-axes de son cadre de placement (l'ovale entier pour les formes
+    coupées) ; angle : rotation affichée de l'empreinte en degrés, sens
+    HORAIRE comme `ajust.angle` (rotation de la forme comprise : ±20° du
+    cœur, rotation des feuilles du trèfle, 180° de l'empreinte 2 en
+    tête-bêche), ramenée dans ]-180, 180] ; zone : [x0, y0, x1, y1] la partie
+    VISIBLE de l'empreinte (son lobe)."""
+    forme = nom_forme(forme)
+    if forme == "separees":
+        return _disposition_planche(n)
+    h, w, contour, lobes, transforms, cadres, centres = _geometrie(forme, n)
+    fx0, _fy0, fx1, _fy1 = _bbox(contour)
+    lobes_info = []
+    for i in range(min(n, len(lobes), len(transforms))):
+        orbite, sur_soi = transforms[i]
+        lobe = lobes[i]
+        if cadres[i] is not None:
+            cadre = cadres[i]
+        else:
+            cadre = lobe if orbite == 0 else lobes[0]
+        cx, cy = centre_lobe(cadre)
+        if cadres[i] is None and orbite != 0:          # trèfle : la toile tourne
+            M = cv2.getRotationMatrix2D((w / 2, h / 2), orbite, 1.0)
+            cx, cy = M @ np.array([cx, cy, 1.0])
+            cadre = lobe                               # (demi-axes : son lobe)
+        bx0, by0, bx1, by1 = _bbox(cadre)
+        rx, ry = (bx1 - bx0) / 2.0, (by1 - by0) / 2.0
+        ajust = (ajusts[i] if ajusts and i < len(ajusts) else None) or {}
+        dx = float(ajust.get("dx", 0.0) or 0.0)
+        dy = float(ajust.get("dy", 0.0) or 0.0)
+        angle = float(ajust.get("angle", 0.0) or 0.0)
+        pivot = centre_lobe(lobe) if centres[i] is None else centres[i]
+        M = cv2.getRotationMatrix2D(pivot, -angle, 1.0)    # comme appliquer_ajust
+        M[0, 2] += dx * RAYON_LOBE
+        M[1, 2] += dy * RAYON_LOBE
+        cx, cy = M @ np.array([cx, cy, 1.0])
+        zx0, zy0, zx1, zy1 = _bbox(lobe)
+        lobes_info.append({
+            "index": i,
+            "cx": round(float(cx) / w, 5), "cy": round(float(cy) / h, 5),
+            "rx": round(rx / w, 5), "ry": round(ry / h, 5),
+            # OpenCV tourne dans le sens anti-horaire : horaire = -(sur-soi + orbite)
+            "angle": round(_normaliser_angle(angle - sur_soi - orbite), 3),
+            "zone": _fractions([zx0, zy0, zx1 + 1, zy1 + 1], [w, h, w, h]),
+        })
+    return {"largeur_forme": round((fx1 - fx0 + 1) / w, 5), "lobes": lobes_info}
+
+
+def _disposition_planche(n):
+    """disposition() de la planche des empreintes séparées : n images
+    d'empreinte seule (même toile chacune) posées côte à côte."""
+    seule = disposition("simple", 1)
+    lobes_info = []
+    for i in range(n):
+        l = dict(seule["lobes"][0])
+        l["index"] = i
+        l["cx"] = round((i + l["cx"]) / n, 5)
+        l["rx"] = round(l["rx"] / n, 5)
+        z = l["zone"]
+        l["zone"] = [round((i + z[0]) / n, 5), z[1], round((i + z[2]) / n, 5), z[3]]
+        lobes_info.append(l)
+    return {"largeur_forme": round(seule["largeur_forme"] / max(n, 1), 5),
+            "lobes": lobes_info}
+
+
+def planche(chemins_png, chemin_sortie, cote_max=2200):
+    """Planche des empreintes séparées : les images d'empreinte seule (rendues
+    par rendre_seule, toutes de la même taille) côte à côte sur fond blanc,
+    sans texte, réduite si besoin à `cote_max` px de large. Renvoie sa
+    disposition (voir disposition)."""
+    images = []
+    for chemin in chemins_png:
+        image = cv2.imread(chemin, cv2.IMREAD_COLOR)
+        if image is None:
+            raise IOError(f"image illisible : {chemin}")
+        images.append(image)
+    if not images:
+        raise ValueError("aucune empreinte")
+    hauteur = max(im.shape[0] for im in images)
+    largeur = max(im.shape[1] for im in images)
+    cases = []
+    for im in images:                    # (même taille en pratique)
+        case = np.full((hauteur, largeur, 3), 255, np.uint8)
+        y0, x0 = (hauteur - im.shape[0]) // 2, (largeur - im.shape[1]) // 2
+        case[y0:y0 + im.shape[0], x0:x0 + im.shape[1]] = im
+        cases.append(case)
+    image = np.hstack(cases)
+    if image.shape[1] > cote_max:
+        echelle = cote_max / float(image.shape[1])
+        image = cv2.resize(image, (cote_max, max(1, int(round(image.shape[0] * echelle)))),
+                           interpolation=cv2.INTER_AREA)
+    if not cv2.imwrite(chemin_sortie, image):
+        raise IOError(f"planche non écrite : {chemin_sortie}")
+    return _disposition_planche(len(images))
+
+
 def principal():
     if len(sys.argv) < 5:
         sys.exit("Utilisation : python3 formes.py <forme> <style> sortie.svg "
                  "mosaique1.png [mosaique2.png ...]\n"
-                 "  forme : simple | coeur | trefle (alias : trefle3, trefle4)\n"
+                 "  forme : simple | coeur | trefle (alias : trefle3, trefle4)"
+                 " | ovale_lr | tete_beche (2 empreintes)\n"
                  "  style : gabor | sans | contact (alias : traits) | photo")
     forme, style, sortie = sys.argv[1], sys.argv[2], sys.argv[3]
     mosaiques = []

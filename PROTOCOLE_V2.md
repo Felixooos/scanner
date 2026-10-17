@@ -27,8 +27,11 @@ L'ancien dossier `commandes/` du projet n'est plus utilisé pour le neuf.
                                      (PNG sans perte, ordre d'acceptation) — pour
                                      re-fusionner plus tard ; OPTIONNEL (absent
                                      des empreintes plus anciennes)
-    rendus/<forme>_<style>.svg       rendus enregistrés
+    rendus/<forme>_<style>.svg       rendus enregistrés (formes assemblées)
     rendus/<forme>_<style>.png
+    rendus/separees_<style>/<NN_prenom>.svg|.png   empreintes séparées : un
+                                     rendu par empreinte (NN_prenom = nom du
+                                     dossier de l'empreinte, ex. 01_louis)
 
 <dossier_commandes>/Exports/                 exports prêts à envoyer (voir EXPORTER)
     <Nom client>/                            le dossier dézippé (pratique dans le Finder)
@@ -60,6 +63,36 @@ elles ne partent PAS dans les exports.
 `ajust` : décalage du placement de l'empreinte DANS son lobe de la forme
 composée — dx, dy en fraction du rayon de lobe (−1..1), angle en degrés
 (rotation de l'empreinte sur elle-même, en plus de la rotation de forme).
+Pour l'ovale coupé et le tête-bêche, la rotation se fait autour du centre
+de l'ovale (là où l'empreinte est posée) ; en tête-bêche l'`angle` de
+l'empreinte 2 s'ajoute à ses 180°.
+
+## Formes
+
+| `forme` | Libellé app | Empreintes | Rendu |
+|---|---|---|---|
+| `separees` | Séparées | toutes | PAS de composition : chaque empreinte est rendue SEULE (comme une commande d'une empreinte : son ovale, son cadrage, sa complétion, sans `ajust`) ; l'aperçu est une planche qui les pose côte à côte |
+| `coeur` | Cœur | 2 | inchangé |
+| `trefle` | Trèfle 3 / Trèfle 4 | 3 ou 4 | inchangé |
+| `ovale_lr` | Ovale coupé | exactement 2 | UN ovale (celui d'une empreinte seule) coupé verticalement par un fin espace vide (22 px, comme le milieu du cœur, rien n'y est gravé) : empreinte 1 dans la moitié GAUCHE, empreinte 2 dans la moitié DROITE |
+| `tete_beche` | Tête-bêche | exactement 2 | le même ovale coupé HORIZONTALEMENT : empreinte 1 droite dans la moitié du HAUT, empreinte 2 tournée de 180° dans la moitié du BAS (on voit le haut de chacune, symétriques) |
+| `simple` | (ancien) | toutes | rétro-compatibilité : n ovales côte à côte, rendu inchangé ; l'app le traite comme `separees` (l'export aussi : pas de rendu assemblé) |
+
+Ovale coupé / tête-bêche : chaque empreinte est mise à l'échelle comme si
+elle remplissait TOUT l'ovale (même échelle qu'une empreinte seule), centrée
+sur le centre de l'ovale (le centre du cadrage ≈ le noyau, la coupure passe
+donc par le noyau), puis découpée par sa moitié ; la complétion remplit la
+demi-zone jusqu'à son bord et les traits s'arrêtent net le long de la
+coupure (aucun bout de crête ne court le long du bord, pas de miettes).
+Tous les styles marchent (`contact`/`traits`, `sans`, `gabor`, `photo`).
+
+Synonymes acceptés : `ovale_coupe` → `ovale_lr` ; `tete-beche`, `tête-bêche`
+→ `tete_beche` ; `separee`, `séparées` → `separees` (+ ceux de toujours :
+`trefle3`, `trefle4`, `cœur`…).
+
+Mauvais nombre d'empreintes pour `ovale_lr` / `tete_beche` (APERCU,
+ENREGISTRER) → `error {raison: "La forme « Ovale coupé » demande exactement
+2 empreintes."}` (« Tête-bêche » pour l'autre), rien n'est calculé.
 
 ## Commandes nouvelles / modifiées
 
@@ -75,6 +108,7 @@ composée — dx, dy en fraction du rayon de lobe (−1..1), angle en degrés
 | `SUPPRIMER_COMMANDE <id>` | déplace le dossier vers `<dossier_commandes>/.corbeille/` | `commandes {…}` rafraîchi |
 | `AJUSTER <i> <dx> <dy> <angle>` | règle `ajust` de l'empreinte i, vide le cache d'aperçus, persiste | `ajuste {index, ajust}` |
 | `EMPREINTE_APERCU <i>` | écrit la photo normalisée de l'empreinte i (avec son crop appliqué) dans un PNG temporaire | `empreinte_apercu {index, png, horodatage}` |
+| `RENDU_EMPREINTE <i> <style>` | l'empreinte i SEULE dans le style (le même rendu que dans l'export : son crop, son completer, sans ajust). Ne change rien à la commande (ni forme, ni style, ni vignette) | `rendu_empreinte {index, style, png, svg, largeur_forme, horodatage}` ; erreur → `error {raison, index}` |
 | `EXPORTER` | prépare l'envoi de la commande courante : dossier lisible au nom du client + zip (détail ci-dessous) | 0..n × `export_progres {etape, total, texte}` puis `exporte {dossier, zip, resume, …}` |
 
 ## EXPORTER en détail
@@ -84,8 +118,8 @@ Arborescence produite (et contenu EXACT du zip, qui a un seul dossier racine) :
 <dossier_commandes>/Exports/<Nom client>.zip
 └── <Nom client>/
     ├── Récapitulatif.txt                       résumé (= `resume`) + détail des fichiers
-    ├── <Nom client> – <Forme> <Style>.svg      rendu final assemblé (si forme choisie
-    ├── <Nom client> – <Forme> <Style>.png       et compatible avec le nombre d'empreintes)
+    ├── <Nom client> – <Forme> <Style>.svg      rendu final assemblé (forme assemblée,
+    ├── <Nom client> – <Forme> <Style>.png       compatible avec le nombre d'empreintes)
     └── <Prénom>/                               un dossier par empreinte, dans l'ordre
         ├── <Prénom> – photo.png                photo normalisée, recadrée
         ├── <Prénom> – <Style>.svg              l'empreinte SEULE dans le style choisi
@@ -95,8 +129,10 @@ Arborescence produite (et contenu EXACT du zip, qui a un seul dossier racine) :
   retirés ; jamais de point en tête. Prénoms en double → `Louis`, `Louis (2)`…
   (comparaison sans casse). Prénom vide → `Empreinte N`. Séparateur « – »
   (tiret demi-cadratin entouré d'espaces).
-- `<Forme>` / `<Style>` = libellés de l'app : `Simple`, `Cœur`, `Trèfle 3`,
-  `Trèfle 4` ; `Gabor`, `Traits` (sans), `Traits soudés` (contact), `Photo`.
+- `<Forme>` / `<Style>` = libellés de l'app : `Cœur`, `Trèfle 3`,
+  `Trèfle 4`, `Ovale coupé`, `Tête-bêche` (ex. « Dupont – Ovale coupé
+  Traits soudés.svg ») ; `Gabor`, `Traits` (sans), `Traits soudés`
+  (contact), `Photo`.
   Pour le style photo, le fichier de l'empreinte s'appelle
   `<Prénom> – Photo découpée.svg/.png` (sinon il écraserait `– photo.png`,
   le Mac ignorant la casse).
@@ -105,10 +141,13 @@ Arborescence produite (et contenu EXACT du zip, qui a un seul dossier racine) :
   respectés, `ajust` ignoré (il ne concerne que les lobes cœur/trèfle).
 - Rendu final : repris tel quel du cache d'aperçus du moteur s'il existe pour
   la forme/le style de la commande (donc après un `APERCU`, l'export ne refait
-  que les empreintes seules), sinon recalculé avec les `ajust`. Pas de rendu
-  final si aucune forme n'est choisie, ni si la forme ne convient plus au
-  nombre d'empreintes (cœur = 2, trèfle = 3 ou 4) — dit dans le récapitulatif
-  et dans `avertissements`.
+  que les empreintes seules), sinon recalculé avec les `ajust`. Seules les
+  formes ASSEMBLÉES en ont un (`coeur`, `trefle`, `ovale_lr`, `tete_beche`) :
+  forme `separees`, `simple` ou pas de forme → seulement les empreintes
+  seules, et le récapitulatif dit « Empreintes séparées : une médaille par
+  empreinte. ». Pas de rendu final non plus si la forme ne convient plus au
+  nombre d'empreintes (cœur, ovale coupé, tête-bêche = 2, trèfle = 3 ou 4)
+  — dit dans le récapitulatif et dans `avertissements`.
 - Aucun style choisi → style par défaut de l'app, `contact` (« Traits
   soudés »), signalé dans `resume` et le récapitulatif (`style_defaut: true`).
 - Un nouvel export remplace l'ancien du même client (dossier ET zip). Tout est
@@ -138,7 +177,8 @@ Arborescence produite (et contenu EXACT du zip, qui a un seul dossier racine) :
   `zip` = `…/Exports/<Nom client>.zip` ; `resume` = texte du mail ;
   `nom` = nom de la commande tel quel, `nom_export` = nom de dossier/zip
   nettoyé ; `fichiers` = chemins absolus de tous les fichiers exportés (ordre
-  du zip) ; `forme` = forme du rendu final ou null ; `style` = style
+  du zip) ; `forme` = forme du rendu final ou null (toujours null pour
+  `separees` / `simple`) ; `style` = style
   canonique exporté (`gabor|sans|contact|photo`) ; `avertissements` = liste
   de phrases (vide si tout va bien).
 - Si `avertissements` n'est pas vide, le moteur envoie EN PLUS, juste après
@@ -161,9 +201,52 @@ Arborescence produite (et contenu EXACT du zip, qui a un seul dossier racine) :
   d'empreintes ou garde les numéros, au choix, mais commande.json fait foi).
 - `APERCU <forme> <style>` : inchangé côté appel ; applique les `ajust`,
   persiste forme/style dans commande.json, régénère `vignette.png`.
+  Pour `separees` : rend chaque empreinte seule (mémoire de RENDU_EMPREINTE)
+  et fabrique une planche propre (les empreintes côte à côte sur fond blanc,
+  sans texte, au plus 2200 px de large) qui sert d'aperçu et de vignette.
+  Événement `apercu_pret {png, forme, style, cache, horodatage,
+  largeur_forme, lobes}` (voir « Disposition » plus bas).
 - `ENREGISTRER <forme> <style>` : écrit dans `<id>/rendus/` (plus dans
   l'ancien dossier), met à jour la vignette. Événement `compose
-  {svg, png, dossier}` (`dossier` = dossier de la commande).
+  {svg, png, dossier, forme, style, nom, id, fichiers}` (`dossier` = dossier
+  de la commande, `fichiers` = tous les fichiers écrits, chemins absolus).
+  `ENREGISTRER separees <style>` écrit `rendus/separees_<style>/<NN_prenom>.svg`
+  et `.png` pour chaque empreinte (le dossier est vidé avant : aucun reste
+  d'une empreinte supprimée) ; `svg`/`png` = ceux de la 1re empreinte,
+  `fichiers` = [svg 1, png 1, svg 2, png 2, …].
+- `RENDU_EMPREINTE <i> <style>` : rendu gardé en mémoire selon le CONTENU
+  (mosaïque, crop, completer, style) — il n'est donc jamais périmé : un
+  recadrage, un changement de complétion ou une suppression (qui renumérote
+  les index) donne simplement un autre rendu. Les 4 styles d'une empreinte
+  enchaînés : ~1 s pour le premier, ~0,05–0,15 s pour les suivants ; déjà
+  calculé : ~0,01 s. `style` est renvoyé tel que demandé ; `png` (aperçu,
+  fond blanc) et `svg` (à graver) sont des chemins absolus qui changent
+  quand le rendu change ; `largeur_forme` comme ci-dessous (ovale d'une
+  empreinte seule ≈ 0,856).
+
+## Disposition (`apercu_pret.largeur_forme`, `apercu_pret.lobes`)
+
+Toutes les valeurs sont des FRACTIONS de la largeur (x) et de la hauteur
+(y) du PNG d'aperçu, pour toutes les formes :
+
+- `largeur_forme` : part de la largeur du PNG occupée par la forme gravée
+  (pour l'affichage « taille réelle 1 cm ») ; pour `separees`, la largeur
+  d'UNE médaille (un ovale) rapportée à la largeur de la planche.
+- `lobes` = `[{index, cx, cy, rx, ry, angle, zone}]`, un par empreinte, dans
+  l'ordre des empreintes :
+  - `cx`, `cy` : centre ACTUEL de l'empreinte i, `ajust` compris (pour
+    l'ovale coupé et le tête-bêche, les deux empreintes sont centrées sur le
+    centre de l'ovale : leurs centres coïncident tant qu'aucune n'est
+    décalée) ;
+  - `rx`, `ry` : demi-axes de son cadre de placement (l'ovale entier pour
+    les formes coupées, le lobe pour cœur / trèfle, l'ovale pour separees) ;
+  - `angle` : rotation affichée de l'empreinte, en degrés, sens HORAIRE
+    comme `ajust.angle`, rotation de la forme comprise (±20° du cœur,
+    rotation des feuilles du trèfle, +180° pour l'empreinte 2 en
+    tête-bêche), ramenée dans ]−180, 180] (tête-bêche sans ajust : 0 et 180) ;
+  - `zone` : `[x0, y0, x1, y1]`, rectangle de la partie VISIBLE de
+    l'empreinte (sa demi-zone, son lobe, son ovale dans la planche) — pour
+    poser l'étiquette « 1 · Louis » dessous et le cadre de sélection.
 - Cache d'aperçus vidé à chaque changement de crop / ajust / suppression /
   renommage n'est pas nécessaire pour renommage (ne change pas l'image).
 
@@ -171,5 +254,9 @@ Arborescence produite (et contenu EXACT du zip, qui a un seul dossier racine) :
 
 - Tous les chemins renvoyés sont ABSOLUS.
 - `formes.composer(...)` gagne un paramètre `ajusts=None`
-  (liste de dicts {dx, dy, angle} ou None) — rétrocompatible.
+  (liste de dicts {dx, dy, angle} ou None) — rétrocompatible. Il lève
+  `ValueError` (message prêt à afficher) si `ovale_lr` / `tete_beche` ne
+  reçoivent pas 2 empreintes. `formes.rendre_seule(...)` rend une empreinte
+  seule, `formes.disposition(forme, n, ajusts)` donne `largeur_forme` /
+  `lobes`, `formes.planche(pngs, sortie)` fabrique la planche `separees`.
 - Le moteur ne doit JAMAIS écrire de non-JSON sur stdout.

@@ -83,7 +83,20 @@ STYLES = {
 
 # Les formes telles que l'app les présente (Moteur.formesDisponibles).
 # Clés = noms canoniques de formes.nom_forme (« trefle3 » -> « trefle »).
-FORMES = {"simple": "Simple", "coeur": "Cœur", "trefle": "Trèfle"}
+FORMES = {"simple": "Simple", "separees": "Séparées", "coeur": "Cœur",
+          "trefle": "Trèfle", "ovale_lr": "Ovale coupé",
+          "tete_beche": "Tête-bêche"}
+# Ce qu'est la forme, dit en toutes lettres (récapitulatif, mail).
+LIBELLE_FORME = {"simple": "empreintes séparées",
+                 "separees": "empreintes séparées",
+                 "coeur": "cœur", "trefle": "trèfle",
+                 "ovale_lr": "ovale coupé (gauche / droite)",
+                 "tete_beche": "ovale tête-bêche"}
+# Formes qui donnent UN rendu assemblé. « separees » (et l'ancien « simple »,
+# que l'app traite comme « separees ») : une médaille par empreinte, donc
+# seulement les empreintes seules.
+FORMES_ASSEMBLEES = ("coeur", "trefle", "ovale_lr", "tete_beche")
+PHRASE_SEPAREES = "Empreintes séparées : une médaille par empreinte."
 
 
 # --------------------------------------------------------------------------
@@ -474,16 +487,28 @@ def libelle_forme(forme, nb):
 
 def forme_compatible(forme, nb):
     """La forme choisie accueille-t-elle nb empreintes ? L'app ne propose le
-    cœur qu'à 2 et le trèfle qu'à 3 ou 4 : une empreinte ajoutée ou retirée
-    après coup rend le choix caduc (le rendu en perdrait une)."""
+    cœur, l'ovale coupé et le tête-bêche qu'à 2 et le trèfle qu'à 3 ou 4 :
+    une empreinte ajoutée ou retirée après coup rend le choix caduc (le rendu
+    en perdrait une)."""
     if not forme or nb < 1:
         return False
     cle = formes.nom_forme(forme)
-    if cle == "coeur":
+    if cle in ("coeur", "ovale_lr", "tete_beche"):
         return nb == 2
     if cle == "trefle":
         return nb in (3, 4)
-    return True                                       # simple : tout nombre
+    return True                       # separees / simple : tout nombre
+
+
+def forme_assemblee(forme):
+    """La forme donne-t-elle un rendu final ASSEMBLÉ ? Non pour « separees »,
+    « simple » ou pas de forme : une médaille par empreinte."""
+    return bool(forme) and formes.nom_forme(forme) in FORMES_ASSEMBLEES
+
+
+def rendu_final_possible(forme, nb):
+    """Un rendu assemblé est-il à produire pour cette forme et nb empreintes ?"""
+    return forme_assemblee(forme) and forme_compatible(forme, nb)
 
 
 def _ecrire_png(chemin, image):
@@ -540,16 +565,25 @@ def role_svg(style):
 
 
 def _ligne_forme_style(cmd):
-    """« Forme : Cœur — Style : Traits soudés. » (avec les cas particuliers)."""
+    """« Forme : Cœur — Style : Traits soudés. » (avec les cas particuliers ;
+    empreintes séparées : « Empreintes séparées : une médaille par
+    empreinte. » puis « Style : … » à la ligne)."""
     nb = len(cmd["empreintes"])
     forme, style = cmd.get("forme"), cmd.get("style")
-    if forme:
-        texte = f"Forme : {libelle_forme(forme, nb)}"
-        if nb and not forme_compatible(forme, nb):
-            texte += (f" (ne convient pas à {nb} empreinte{'s' * (nb > 1)} : "
-                      "rendu final à refaire dans l'app)")
-    else:
-        texte = "Forme : pas encore choisie"
+    if not forme_assemblee(forme):
+        texte = f"{PHRASE_SEPAREES}\nStyle : {libelle_style(style)}"
+        if not style:
+            texte += " (style par défaut de l'app, aucun n'a encore été choisi)"
+        return texte + "."
+    cle = formes.nom_forme(forme)
+    if cle in ("ovale_lr", "tete_beche"):          # « Ovale coupé (gauche / droite) »
+        nom_forme = LIBELLE_FORME[cle][:1].upper() + LIBELLE_FORME[cle][1:]
+    else:                                          # « Cœur », « Trèfle 3 »
+        nom_forme = libelle_forme(forme, nb)
+    texte = f"Forme : {nom_forme}"
+    if nb and not forme_compatible(forme, nb):
+        texte += (f" (ne convient pas à {nb} empreinte{'s' * (nb > 1)} : "
+                  "rendu final à refaire dans l'app)")
     texte += f" — Style : {libelle_style(style)}"
     if not style:
         texte += " (style par défaut de l'app, aucun n'a encore été choisi)"
@@ -588,7 +622,7 @@ def resume(cmd):
             contenu = ("Le dossier joint contient, pour chaque empreinte, sa "
                        f"photo et son tracé « {libelle_style(cmd.get('style'))} »"
                        " (SVG vectoriel prêt à graver, PNG pour regarder)")
-        if forme_compatible(cmd.get("forme"), nb):
+        if rendu_final_possible(cmd.get("forme"), nb):
             contenu += ", ainsi que le rendu final assemblé"
         lignes.append(contenu + ".")
     return "\n".join(lignes)
@@ -707,15 +741,16 @@ def exporter(cmd, dossier_racine=None, rendu_compose=None, progres=None):
                          else nom_style)
     forme = cmd.get("forme")
     avertissements = []
-    if forme and nb and not forme_compatible(forme, nb):
+    if forme_assemblee(forme) and nb and not forme_compatible(forme, nb):
         avertissements.append(
             f"la forme « {libelle_forme(forme, nb)} » ne convient pas à {nb} "
             f"empreinte{'s' * (nb > 1)} : pas de rendu final, à refaire dans "
             "l'app.")
 
     nom = nom_lisible(cmd.get("nom"), "Commande")
+    # separees / simple / pas de forme : seulement les empreintes seules
     compose = (nom_lisible(f"{nom}{TIRET}{libelle_forme(forme, nb)} {nom_style}")
-               if forme_compatible(forme, nb) else None)
+               if rendu_final_possible(forme, nb) else None)
     total = nb + (1 if compose else 0) + 1
     fait = [0]
 
@@ -762,16 +797,12 @@ def exporter(cmd, dossier_racine=None, rendu_compose=None, progres=None):
             fiches.append(fiche)
 
         # 2. le rendu final : copié de l'aperçu du moteur s'il est à jour,
-        #    copié du tracé seul s'il lui est identique, sinon recalculé
+        #    sinon recalculé
         svg_c = os.path.join(base, f"{compose}.svg") if compose else None
         png_c = os.path.join(base, f"{compose}.png") if compose else None
         deja = rendu_compose or {}
         compose_en_cache = bool(compose) and all(
             deja.get(k) and os.path.isfile(deja[k]) for k in ("svg", "png"))
-        compose_comme_seul = (bool(compose) and not compose_en_cache
-                              and nb == 1
-                              and formes.nom_forme(forme) == "simple"
-                              and _ajust_neutre(empreintes[0].get("ajust")))
         compose_ok = False
         if compose_en_cache:
             shutil.copyfile(deja["svg"], svg_c)
@@ -782,7 +813,7 @@ def exporter(cmd, dossier_racine=None, rendu_compose=None, progres=None):
         # 3. les tracés (et le rendu final à recalculer), en parallèle
         with ThreadPoolExecutor(max_workers=TRAVAILLEURS_EXPORT) as atelier:
             travaux = {}
-            if compose and not compose_en_cache and not compose_comme_seul:
+            if compose and not compose_en_cache:
                 # le plus long (une complétion par lobe) : lancé en premier
                 travaux[atelier.submit(
                     rendre, [e.get("mosaique") for e in empreintes], forme,
@@ -822,16 +853,6 @@ def exporter(cmd, dossier_racine=None, rendu_compose=None, progres=None):
                     fiches[i]["trace"] = fiches[i]["_trace"]
                     avancer(f"{fiches[i]['prenom']} : tracé {nom_style} prêt")
 
-        if compose_comme_seul:
-            seul = fiches[0]["trace"]
-            if seul:
-                dossier_seul = os.path.join(base, fiches[0]["prenom"])
-                shutil.copyfile(os.path.join(dossier_seul, seul[0]), svg_c)
-                shutil.copyfile(os.path.join(dossier_seul, seul[1]), png_c)
-                compose_ok = True
-            else:
-                avertissements.append("le rendu final est impossible.")
-            avancer(f"Rendu final {libelle_forme(forme, nb)} prêt")
         if compose and not compose_ok:
             compose = None                    # rien de faux dans le zip
 

@@ -24,8 +24,10 @@ Commandes reconnues (une par ligne) :
     VALIDER <crop…>       -> range l'empreinte scannée (écrite sur disque)
     RECADRER <i>          -> rouvre le cadrage de l'empreinte i
     SUPPRIMER <i>         -> retire l'empreinte i (disque compris)
-    APERCU <forme> <style>      -> aperçu du rendu composé
+    APERCU <forme> <style>      -> aperçu du rendu composé (ou, pour
+                                   « separees », planche des empreintes seules)
     ENREGISTRER <forme> <style> -> rendu définitif dans <commande>/rendus/
+    RENDU_EMPREINTE <i> <style> -> l'empreinte i SEULE dans un style
 
     DOSSIER [chemin]      -> lit / change le dossier de stockage
     COMMANDES             -> liste les commandes rangées sur le disque
@@ -41,17 +43,23 @@ Commandes reconnues (une par ligne) :
     ready, ports, connected, status, bouton, touche, scan_ok, scan_rejete,
     scan_fail, reset, final, commande, commandes, dossier, empreinte_debut,
     empreinte_validee, recadrer, ajuste, empreinte_apercu, apercu_pret,
-    compose, export_progres, exporte, error, bye
+    rendu_empreinte, compose, export_progres, exporte, error, bye
+
+Formes : coeur (2), trefle (3-4), ovale_lr (« Ovale coupé », 2), tete_beche
+(« Tête-bêche », 2), separees (chaque empreinte seule), simple (ancien nom,
+ovales côte à côte, accepté tel quel).
 
 Tout est rangé sur le disque par magasin_commandes.py — voir PROTOCOLE_V2.md.
 """
 
+import hashlib
 import json
 import os
 import shutil
 import sys
 import threading
 import time
+from collections import OrderedDict
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -122,7 +130,15 @@ personne = ""                                     # prénom en cours de scan
 edition_index = None                              # empreinte en cours de re-cadrage
 DOSSIER_APERCUS = os.path.join(cap.DOSSIER_PHOTOS, "_apercus")
 os.makedirs(DOSSIER_APERCUS, exist_ok=True)
-apercus = {}                                      # "forme|style" -> {svg, png}
+apercus = {}                                      # "forme|style" -> {svg, png, …}
+# Rendus d'UNE empreinte seule (RENDU_EMPREINTE, forme « separees ») : repérés
+# par le CONTENU (mosaïque, cadrage, complétion, style), donc jamais périmés —
+# un recadrage ou une suppression (qui renumérote) donne une autre clé.
+DOSSIER_SEULES = os.path.join(DOSSIER_APERCUS, "seules")
+shutil.rmtree(DOSSIER_SEULES, ignore_errors=True)      # fichiers de la veille
+os.makedirs(DOSSIER_SEULES, exist_ok=True)
+rendus_seuls = OrderedDict()                      # signature -> {svg, png}
+RENDUS_SEULS_MAX = 64
 
 
 def _vider_apercus():
@@ -727,22 +743,99 @@ def supprimer_empreinte(index):
     envoyer_validee()
 
 
+def _signature_seule(e, style):
+    """Clé d'un rendu d'empreinte seule : contenu de la mosaïque + cadrage +
+    complétion + style canonique."""
+    h = hashlib.blake2b(digest_size=12)
+    mosaique = e["mosaique"]
+    h.update(f"{mosaique.shape}{mosaique.dtype}".encode())
+    h.update(mosaique.tobytes())
+    crop = list(e["crop"]) if e.get("crop") else None
+    h.update(repr((crop, bool(e.get("completer", True)),
+                   frm.nom_style(style))).encode())
+    return h.hexdigest()
+
+
+def _rendu_seul(e, style):
+    """L'empreinte e SEULE dans un style — le même rendu que dans l'export
+    (mag.rendre_empreinte : son cadrage et sa complétion, sans ajust).
+    Renvoie {svg, png} (gardé en mémoire, voir rendus_seuls)."""
+    sig = _signature_seule(e, style)
+    deja = rendus_seuls.get(sig)
+    if deja and os.path.isfile(deja["svg"]) and os.path.isfile(deja["png"]):
+        rendus_seuls.move_to_end(sig)
+        return deja
+    svg = os.path.join(DOSSIER_SEULES, f"empreinte_{sig}.svg")
+    png = os.path.join(DOSSIER_SEULES, f"empreinte_{sig}.png")
+    mag.rendre_empreinte(e, style, svg, png)
+    rendus_seuls[sig] = {"svg": svg, "png": png}
+    while len(rendus_seuls) > RENDUS_SEULS_MAX:      # les plus anciens partent
+        _, vieux = rendus_seuls.popitem(last=False)
+        for chemin in vieux.values():
+            try:
+                os.remove(chemin)
+            except OSError:
+                pass
+    return rendus_seuls[sig]
+
+
 def _generer_apercu(forme, style):
-    """Génère (ou récupère du cache) le SVG + PNG d'aperçu pour forme/style."""
+    """Génère (ou récupère du cache) le SVG + PNG d'aperçu pour forme/style,
+    avec sa disposition (largeur_forme, lobes : voir formes.disposition).
+    Forme « separees » : chaque empreinte rendue seule (rendus_seuls) et une
+    planche qui les pose côte à côte ; `seules` = [{svg, png}] par empreinte,
+    `svg` = None (pas de rendu assemblé)."""
     cle = f"{forme}|{style}"
     if cle in apercus:
         return apercus[cle]
     empreintes = commande["empreintes"]
+    png = os.path.join(DOSSIER_APERCUS, f"apercu_{forme}_{style}.png")
+    if frm.nom_forme(forme) == "separees":
+        seules = [_rendu_seul(e, style) for e in empreintes]
+        dispo = frm.planche([r["png"] for r in seules], png)
+        apercus[cle] = {"svg": None, "png": png, "seules": seules,
+                        "disposition": dispo}
+        return apercus[cle]
     mosaiques = [e["mosaique"] for e in empreintes]
     crops = [e.get("crop") for e in empreintes]
     completions = [e.get("completer", True) for e in empreintes]
     ajusts = [e.get("ajust") for e in empreintes]
     svg = os.path.join(DOSSIER_APERCUS, f"apercu_{forme}_{style}.svg")
-    png = os.path.join(DOSSIER_APERCUS, f"apercu_{forme}_{style}.png")
     frm.composer(mosaiques, forme, style, svg, apercu_png=png,
                  crops=crops, completions=completions, ajusts=ajusts)
-    apercus[cle] = {"svg": svg, "png": png}
+    apercus[cle] = {"svg": svg, "png": png,
+                    "disposition": frm.disposition(forme, len(mosaiques),
+                                                   ajusts)}
     return apercus[cle]
+
+
+def rendu_empreinte(argument):
+    """RENDU_EMPREINTE <i> <style> : l'empreinte i SEULE dans un style (son
+    cadrage et sa complétion, sans ajust) — le rendu de l'export. Gardé en
+    mémoire : les styles d'une même empreinte s'enchaînent vite."""
+    parties = (argument or "").split()
+    index = None
+    try:
+        index = int(parties[0])
+        style = parties[1].lower()
+        if index < 0:
+            raise IndexError
+        e = commande["empreintes"][index]
+    except (ValueError, IndexError):
+        envoyer(event="error", index=index,
+                raison="usage : RENDU_EMPREINTE <i> <style> (index d'empreinte "
+                       "invalide ?)")
+        return
+    try:
+        res = _rendu_seul(e, style)
+    except Exception as erreur:
+        envoyer(event="error", index=index,
+                raison=f"Rendu de l'empreinte : {erreur}")
+        return
+    envoyer(event="rendu_empreinte", index=index, style=style, png=res["png"],
+            svg=res["svg"],
+            largeur_forme=frm.disposition("simple", 1)["largeur_forme"],
+            horodatage=int(time.time() * 1000))
 
 
 def _majer_vignette(png):
@@ -765,6 +858,10 @@ def apercu_compose(argument):
     if not commande["empreintes"]:
         envoyer(event="scan_fail", raison="Aucune empreinte dans la commande.")
         return
+    probleme = frm.erreur_nombre(forme, len(commande["empreintes"]))
+    if probleme:                       # « … demande exactement 2 empreintes. »
+        envoyer(event="error", raison=probleme)
+        return
     deja = f"{forme}|{style}" in apercus
     if not deja:
         envoyer(event="status", texte=f"Génération de l'aperçu {forme} / {style}…")
@@ -782,8 +879,11 @@ def apercu_compose(argument):
     if _assurer_dossier():
         _majer_vignette(res["png"])
         _persister(complet=False)
+    dispo = res.get("disposition") or {}
     envoyer(event="apercu_pret", png=res["png"], forme=forme, style=style,
-            cache=deja, horodatage=int(time.time() * 1000))
+            cache=deja, horodatage=int(time.time() * 1000),
+            largeur_forme=dispo.get("largeur_forme"),
+            lobes=dispo.get("lobes") or [])
 
 
 def enregistrer_compose(argument):
@@ -796,6 +896,10 @@ def enregistrer_compose(argument):
     if not commande["empreintes"]:
         envoyer(event="scan_fail", raison="Aucune empreinte dans la commande.")
         return
+    probleme = frm.erreur_nombre(forme, len(commande["empreintes"]))
+    if probleme:
+        envoyer(event="error", raison=probleme)
+        return
     if not _assurer_dossier():
         return
     try:
@@ -803,10 +907,27 @@ def enregistrer_compose(argument):
         dossier_rendus = os.path.join(commande["dossier"], "rendus")
         os.makedirs(dossier_rendus, exist_ok=True)
         base = f"{_nom_fichier(forme)}_{_nom_fichier(style)}"
-        final = os.path.join(dossier_rendus, base + ".svg")
-        final_png = os.path.join(dossier_rendus, base + ".png")
-        shutil.copyfile(res["svg"], final)
-        shutil.copyfile(res["png"], final_png)
+        if res.get("seules") is not None:
+            # empreintes séparées : rendus/separees_<style>/<NN_prénom>.svg/.png
+            dossier = os.path.join(dossier_rendus, base)
+            shutil.rmtree(dossier, ignore_errors=True)   # pas de reste périmé
+            os.makedirs(dossier, exist_ok=True)
+            fichiers = []
+            for i, (e, seule) in enumerate(zip(commande["empreintes"],
+                                               res["seules"])):
+                nom = os.path.basename(e.get("_dossier") or "") \
+                    or f"{i + 1:02d}_{mag.slug(e.get('nom'), f'empreinte-{i + 1}')}"
+                for cle_fichier, ext in (("svg", ".svg"), ("png", ".png")):
+                    cible = os.path.join(dossier, nom + ext)
+                    shutil.copyfile(seule[cle_fichier], cible)
+                    fichiers.append(cible)
+            final, final_png = fichiers[0], fichiers[1]
+        else:
+            final = os.path.join(dossier_rendus, base + ".svg")
+            final_png = os.path.join(dossier_rendus, base + ".png")
+            shutil.copyfile(res["svg"], final)
+            shutil.copyfile(res["png"], final_png)
+            fichiers = [final, final_png]
     except Exception as erreur:
         led("ERREUR")
         envoyer(event="error", raison=f"Enregistrement : {erreur}")
@@ -817,7 +938,7 @@ def enregistrer_compose(argument):
     _persister(complet=False)
     envoyer(event="compose", svg=final, png=final_png,
             dossier=commande["dossier"], forme=forme, style=style,
-            nom=commande["nom"], id=commande["id"])
+            nom=commande["nom"], id=commande["id"], fichiers=fichiers)
 
 
 def injecter_empreinte(chemin):
@@ -894,6 +1015,8 @@ def boucle():
                 supprimer_commande(argument)
             elif verbe == "AJUSTER":
                 ajuster_empreinte(argument)
+            elif verbe == "RENDU_EMPREINTE":
+                rendu_empreinte(argument)
             elif verbe == "EMPREINTE_APERCU":
                 apercu_empreinte(argument)
             elif verbe == "EXPORTER":
