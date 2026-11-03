@@ -1,7 +1,7 @@
 {
-  "version": "2.1",
-  "date": "2026-08-01",
-  "notes": "Le capteur s'éteint tout seul quand on ferme l'application.",
+  "version": "3.0",
+  "date": "2026-11-03",
+  "notes": "Nouvelle app : vrai logo, étapes plus claires, chaque empreinte visible seule, nouvelles formes (ovale coupé, tête-bêche), les taches s'effacent avec les poses suivantes, rendus beaucoup plus rapides, dossier par client prêt à envoyer par mail.",
   "zip": "https://raw.githubusercontent.com/Felixooos/scanner/main/dist/Empreinte_MMD.zip",
   "paquets_python": ["pyserial","numpy","opencv-python","scipy","scikit-image","fingerprint-enhancer"]
 }
