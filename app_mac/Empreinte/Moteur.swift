@@ -127,6 +127,52 @@ struct Export: Equatable {
     }
 }
 
+/// Ce que maman joint au mail. Le choix est retenu d'un envoi à l'autre.
+enum ContenuMail: String, CaseIterable, Identifiable {
+    case aGraver          // un SVG par empreinte (+ le rendu assemblé)
+    case aGraverEtPhotos  // les mêmes SVG + la photo de chaque empreinte
+    case toutLeDossier    // le zip complet (SVG, aperçus PNG, photos, récapitulatif)
+
+    var id: String { rawValue }
+    var titre: String {
+        switch self {
+        case .aGraver:         return "Fichiers à graver"
+        case .aGraverEtPhotos: return "À graver + photos"
+        case .toutLeDossier:   return "Tout le dossier"
+        }
+    }
+    var aide: String {
+        switch self {
+        case .aGraver:         return "Un SVG par empreinte, au prénom de chacun."
+        case .aGraverEtPhotos: return "Les SVG, plus la photo de chaque empreinte."
+        case .toutLeDossier:   return "Un zip : SVG, aperçus, photos et récapitulatif."
+        }
+    }
+    var symbole: String {
+        switch self {
+        case .aGraver:         return "scribble.variable"
+        case .aGraverEtPhotos: return "photo.on.rectangle"
+        case .toutLeDossier:   return "doc.zipper"
+        }
+    }
+}
+
+extension Export {
+    /// Les fichiers à joindre pour ce choix (chemins absolus). Les noms
+    /// portent déjà le prénom : « Louis – Traits soudés.svg ».
+    func piecesJointes(_ contenu: ContenuMail) -> [String] {
+        let svg = fichiers.filter { $0.lowercased().hasSuffix(".svg") }
+        let photos = fichiers.filter {
+            ($0 as NSString).lastPathComponent.lowercased().hasSuffix(" photo.png")
+        }
+        switch contenu {
+        case .aGraver:         return svg.sorted()
+        case .aGraverEtPhotos: return (svg + photos).sorted()
+        case .toutLeDossier:   return [zip]
+        }
+    }
+}
+
 /// Un lobe de la forme assemblée, tel que le moteur le décrit dans
 /// `apercu_pret.lobes` : où est l'empreinte i SUR le PNG d'aperçu (fractions
 /// de largeur / hauteur), ses demi-axes de placement, son angle affiché et
@@ -227,6 +273,13 @@ final class Moteur: ObservableObject {
     @Published var exportEnCours = false
     @Published var exportProgres: ProgresExport? = nil
     @Published var dernierExport: Export? = nil
+    @Published var contenuMail: ContenuMail =
+        ContenuMail(rawValue: UserDefaults.standard.string(forKey: "contenuMail") ?? "") ?? .aGraver {
+        didSet { UserDefaults.standard.set(contenuMail.rawValue, forKey: "contenuMail") }
+    }
+    /// Conseil affiché sous les boutons quand le mail ne peut pas recevoir
+    /// les fichiers tout seul (mail dans un navigateur).
+    @Published var aideMail: String? = nil
 
     // cadrage
     @Published var cropInitial: [Double]? = nil
@@ -724,20 +777,103 @@ final class Moteur: ObservableObject {
         guard !exportEnCours else { return }
         exportEnCours = true
         exportProgres = nil
+        aideMail = nil
         statut = "Préparation du dossier à envoyer…"
         envoyer("EXPORTER")
     }
 
-    /// Ouvre le compositeur de mail avec le zip en pièce jointe et le
+    /// Ouvre un mail avec les fichiers choisis en pièces jointes et le
     /// récapitulatif en corps de message : maman envoie elle-même.
+    ///
+    /// Le partage macOS (NSSharingService) ne sait déposer des pièces jointes
+    /// que dans un VRAI logiciel de mail (Mail, Outlook, Spark…). Quand le
+    /// mail par défaut est un navigateur (Gmail, Outlook web…), il n'ouvre
+    /// qu'un message vide : on sélectionne alors les fichiers dans le Finder
+    /// pour qu'elle les glisse, et le texte part dans le presse-papiers.
     func envoyerParMail() {
         guard let e = dernierExport else { return }
-        guard let service = NSSharingService(named: .composeEmail) else {
-            signaler("Aucun logiciel de mail configuré sur ce Mac.")
+        let fm = FileManager.default
+        let choisis = e.piecesJointes(contenuMail).filter { fm.fileExists(atPath: $0) }
+        guard !choisis.isEmpty else {
+            signaler("Aucun fichier à joindre : relance « Préparer le dossier ».")
             return
         }
-        service.subject = "Empreintes — \(nomCommande)"
-        service.perform(withItems: [e.resume, URL(fileURLWithPath: e.zip)])
+        let pieces = rassemblerPiecesJointes(choisis, export: e)
+        let sujet = "Empreintes — \(nomCommande)"
+        let nb = pieces.count == 1 ? "1 pièce jointe" : "\(pieces.count) pièces jointes"
+        let logiciel = Self.logicielDeMail()
+
+        if Self.accepteLesPiecesJointes(logiciel), let service = NSSharingService(named: .composeEmail) {
+            service.subject = sujet
+            service.perform(withItems: [e.resume as Any] + pieces.map { $0 as Any })
+            aideMail = nil
+            statut = "Mail ouvert avec \(nb)."
+            return
+        }
+
+        let presse = NSPasteboard.general
+        presse.clearContents()
+        presse.setString(e.resume, forType: .string)
+        NSWorkspace.shared.activateFileViewerSelecting(pieces)
+        if logiciel != nil {
+            var c = URLComponents()
+            c.scheme = "mailto"
+            c.queryItems = [URLQueryItem(name: "subject", value: sujet)]
+            if let u = c.url { NSWorkspace.shared.open(u) }
+            aideMail = "Ton mail s'ouvre dans le navigateur, qui ne peut pas recevoir les fichiers " +
+                       "tout seul. Ils sont sélectionnés dans le Finder (\(nb)) : glisse-les dans le " +
+                       "message. Le récapitulatif est copié : colle-le avec ⌘V."
+        } else {
+            aideMail = "Aucun logiciel de mail n'est réglé sur ce Mac. Les fichiers sont sélectionnés " +
+                       "dans le Finder (\(nb)) et le récapitulatif est copié : joins-les à ton mail."
+        }
+        statut = "Fichiers prêts à glisser dans le mail."
+    }
+
+    /// Montre dans le Finder exactement les fichiers du choix, à glisser à la main.
+    func montrerPiecesJointes() {
+        guard let e = dernierExport else { return }
+        let choisis = e.piecesJointes(contenuMail).filter { FileManager.default.fileExists(atPath: $0) }
+        guard !choisis.isEmpty else { return }
+        NSWorkspace.shared.activateFileViewerSelecting(rassemblerPiecesJointes(choisis, export: e))
+    }
+
+    /// Recopie les fichiers choisis À PLAT dans « Exports/<Client> – à joindre/ » :
+    /// une seule fenêtre du Finder pour tout glisser (au lieu d'un dossier par
+    /// prénom). Un fichier unique (le zip) est rendu tel quel.
+    private func rassemblerPiecesJointes(_ chemins: [String], export e: Export) -> [URL] {
+        let sources = chemins.map { URL(fileURLWithPath: $0) }
+        guard sources.count > 1 else { return sources }
+        let fm = FileManager.default
+        let exports = URL(fileURLWithPath: (e.dossier as NSString).standardizingPath)
+            .deletingLastPathComponent()
+        let nom = (e.nomExport.isEmpty ? nomCommande : e.nomExport) + " – à joindre"
+        let dossier = exports.appendingPathComponent(nom, isDirectory: true)
+        try? fm.removeItem(at: dossier)
+        guard (try? fm.createDirectory(at: dossier, withIntermediateDirectories: true)) != nil else {
+            return sources
+        }
+        return sources.map { source in
+            let cible = dossier.appendingPathComponent(source.lastPathComponent)
+            return (try? fm.copyItem(at: source, to: cible)) != nil ? cible : source
+        }
+    }
+
+    /// L'identifiant de l'app qui ouvre les liens « mailto: » (nil = aucune).
+    static func logicielDeMail() -> String? {
+        guard let lien = URL(string: "mailto:client@exemple.fr"),
+              let app = NSWorkspace.shared.urlForApplication(toOpen: lien) else { return nil }
+        return Bundle(url: app)?.bundleIdentifier?.lowercased()
+    }
+
+    /// Vrai pour un logiciel de mail installé (Mail, Outlook, Spark…), faux
+    /// pour un navigateur : lui n'ouvre qu'un message vide, sans fichiers.
+    static func accepteLesPiecesJointes(_ id: String?) -> Bool {
+        guard let id else { return false }
+        let navigateurs = ["com.google.chrome", "com.apple.safari", "org.mozilla.firefox",
+                           "com.microsoft.edgemac", "company.thebrowser", "com.brave.browser",
+                           "com.operasoftware.opera", "com.vivaldi.vivaldi"]
+        return !navigateurs.contains { id.hasPrefix($0) }
     }
 
     func montrerDansFinder(_ chemin: String) {

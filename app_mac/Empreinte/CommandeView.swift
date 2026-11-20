@@ -667,9 +667,10 @@ struct EtapeEnvoi: View {
                 TitreSection(texte: "Comment ça se passe")
             }
             Text("Le dossier est préparé au nom du client (un sous-dossier par empreinte, " +
-                 "avec sa photo et son tracé), puis compressé en zip. Ensuite, un clic ouvre " +
-                 "un mail avec le zip en pièce jointe et le récapitulatif déjà rédigé : " +
-                 "tu n'as plus qu'à mettre l'adresse et envoyer.")
+                 "avec sa photo et son tracé), puis compressé en zip. Tu choisis ce qui part " +
+                 "dans le mail (les fichiers à graver, avec ou sans les photos, ou tout le " +
+                 "dossier), puis un clic ouvre le mail avec les pièces jointes et le " +
+                 "récapitulatif déjà rédigé : tu n'as plus qu'à mettre l'adresse et envoyer.")
                 .police(11.5, .medium).foregroundColor(MMD.gris)
                 .fixedSize(horizontal: false, vertical: true)
         }
@@ -687,36 +688,118 @@ struct ActionsEnvoi: View {
     @State private var copie = false
 
     var body: some View {
-        HStack(spacing: 8 * echelle) {
-            Button {
-                moteur.envoyerParMail()
-            } label: {
-                HStack(spacing: 7 * echelle) {
-                    Image(systemName: "envelope.fill").police(12, .heavy)
-                    Text("Envoyer par mail").lineLimit(1).fixedSize()
+        VStack(alignment: .leading, spacing: 12 * echelle) {
+            ChoixPiecesJointes(moteur: moteur, export: export)
+            HStack(spacing: 8 * echelle) {
+                Button {
+                    moteur.envoyerParMail()
+                } label: {
+                    HStack(spacing: 7 * echelle) {
+                        Image(systemName: "envelope.fill").police(12, .heavy)
+                        Text("Envoyer par mail").lineLimit(1).fixedSize()
+                    }
                 }
+                .buttonStyle(BoutonPrincipal())
+                Button {
+                    moteur.montrerDansFinder(export.zip)
+                } label: {
+                    HStack(spacing: 6 * echelle) {
+                        Image(systemName: "folder").police(11.5, .bold)
+                        Text("Montrer dans le Finder").lineLimit(1).fixedSize()
+                    }
+                }
+                .buttonStyle(BoutonSecondaire())
+                Button {
+                    moteur.copierRecapitulatif()
+                    withAnimation { copie = true }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 2) { withAnimation { copie = false } }
+                } label: {
+                    HStack(spacing: 6 * echelle) {
+                        Image(systemName: copie ? "checkmark" : "doc.on.doc").police(11.5, .bold)
+                        Text(copie ? "Copié !" : "Copier le récapitulatif").lineLimit(1).fixedSize()
+                    }
+                }
+                .buttonStyle(BoutonSecondaire())
             }
-            .buttonStyle(BoutonPrincipal())
+            if let aide = moteur.aideMail {
+                HStack(alignment: .top, spacing: 8 * echelle) {
+                    Image(systemName: "hand.point.up.left.fill").police(12, .bold).foregroundColor(MMD.doreFonce)
+                    Text(aide).police(12, .semibold).foregroundColor(MMD.encre.opacity(0.85))
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .padding(12 * echelle).frame(maxWidth: .infinity, alignment: .leading)
+                .carte(rayon: 14, fond: MMD.doreClair, cerne: MMD.dore.opacity(0.5), ombre: false)
+                .transition(.opacity)
+            }
             Button {
-                moteur.montrerDansFinder(export.zip)
+                moteur.montrerPiecesJointes()
             } label: {
                 HStack(spacing: 6 * echelle) {
-                    Image(systemName: "folder").police(11.5, .bold)
-                    Text("Montrer dans le Finder").lineLimit(1).fixedSize()
+                    Image(systemName: "paperclip").police(11, .bold)
+                    Text("Les fichiers ne sont pas dans le mail ? Les montrer pour les glisser")
+                        .lineLimit(1)
                 }
             }
-            .buttonStyle(BoutonSecondaire())
-            Button {
-                moteur.copierRecapitulatif()
-                withAnimation { copie = true }
-                DispatchQueue.main.asyncAfter(deadline: .now() + 2) { withAnimation { copie = false } }
-            } label: {
-                HStack(spacing: 6 * echelle) {
-                    Image(systemName: copie ? "checkmark" : "doc.on.doc").police(11.5, .bold)
-                    Text(copie ? "Copié !" : "Copier le récapitulatif").lineLimit(1).fixedSize()
-                }
-            }
-            .buttonStyle(BoutonSecondaire())
+            .buttonStyle(BoutonDiscret(couleur: MMD.gris))
         }
+        .animation(.easeOut(duration: 0.2), value: moteur.aideMail)
+    }
+}
+
+/// Que joindre au mail : les fichiers à graver seuls, avec les photos, ou
+/// tout le dossier en zip. Montre la liste exacte des fichiers qui partiront.
+struct ChoixPiecesJointes: View {
+    @ObservedObject var moteur: Moteur
+    let export: Export
+    @Environment(\.echelle) private var echelle
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 9 * echelle) {
+            HStack(spacing: 7 * echelle) {
+                Image(systemName: "paperclip").police(11, .bold).foregroundColor(MMD.gris)
+                TitreSection(texte: "Dans le mail")
+            }
+            HStack(spacing: 8 * echelle) {
+                ForEach(ContenuMail.allCases) { choix in
+                    carte(choix)
+                }
+            }
+            .fixedSize(horizontal: false, vertical: true)   // 3 cartes de même hauteur, sans vide
+            let fichiers = export.piecesJointes(moteur.contenuMail)
+                .map { ($0 as NSString).lastPathComponent }
+            Text((fichiers.count == 1 ? "1 fichier : " : "\(fichiers.count) fichiers : ")
+                 + fichiers.joined(separator: " · "))
+                .police(11, .medium).foregroundColor(MMD.gris)
+                .lineLimit(2).truncationMode(.middle)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private func carte(_ choix: ContenuMail) -> some View {
+        let choisi = moteur.contenuMail == choix
+        return Button {
+            withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) { moteur.contenuMail = choix }
+        } label: {
+            VStack(alignment: .leading, spacing: 4 * echelle) {
+                HStack(spacing: 6 * echelle) {
+                    Image(systemName: choix.symbole).police(12, .bold)
+                    Text(choix.titre).police(12.5, .heavy).lineLimit(1)
+                    Spacer(minLength: 0)
+                    if choisi {
+                        Image(systemName: "checkmark.circle.fill").police(12, .bold).foregroundColor(MMD.roseFonce)
+                    }
+                }
+                .foregroundColor(MMD.encre)
+                Text(choix.aide).police(10.5, .medium).foregroundColor(MMD.gris)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .padding(10 * echelle)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            .carte(rayon: 14, fond: choisi ? MMD.roseClair : MMD.blanc,
+                   cerne: choisi ? MMD.roseFonce.opacity(0.7) : MMD.trait, ombre: false)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
     }
 }
